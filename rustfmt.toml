@@ -1,0 +1,3 @@
+# LIU uses KNF (docs/style.md), which rustfmt cannot produce.
+# Do not run `cargo fmt`; use `cargo xtask style` instead.
+disable_all_formatting = true

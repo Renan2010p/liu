@@ -1,0 +1,42 @@
+# Configuration for `cargo xtask gen-header`.
+language = "C"
+include_guard = "LIU_HOST_H"
+autogen_warning = """/*
+ * Generated from crates/liu-abi by `cargo xtask gen-header`.
+ * DO NOT EDIT. Change the Rust definitions and regenerate.
+ */"""
+header = "/* SPDX-License-Identifier: MPL-2.0 OR GPL-2.0-only */"
+sys_includes = ["stddef.h", "stdint.h"]
+no_includes = true
+usize_is_size_t = true
+style = "both"
+documentation = true
+documentation_style = "doxy"
+cpp_compat = false
+trailer = """
+/* ELF entry point of the kernel image; see KernelEntry in liu-abi. */
+liu_status liu_kernel_entry(const struct liu_host_ops *host,
+                            struct liu_kernel_ops *kernel,
+                            const struct liu_boot_info *boot);"""
+
+[parse]
+parse_deps = false
+
+[export]
+prefix = "LIU_"
+renaming_overrides_prefixing = true
+include = ["HostOps", "KernelOps", "BootInfo", "GuestRegs", "TrapEvent", "TableHeader"]
+exclude = ["Error", "TrapKind", "Compat", "TypeLayout", "TYPES", "KernelEntry"]
+
+[export.rename]
+"HostOps" = "liu_host_ops"
+"KernelOps" = "liu_kernel_ops"
+"BootInfo" = "liu_boot_info"
+"GuestRegs" = "liu_guest_regs"
+"TrapEvent" = "liu_trap_event"
+"TableHeader" = "liu_table_header"
+"Status" = "liu_status"
+"Handle" = "liu_handle"
+
+[fn]
+args = "auto"

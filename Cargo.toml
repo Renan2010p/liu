@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/liu-abi",
+    "crates/liu-elf",
+    "crates/liu-platform",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "MPL-2.0"
+rust-version = "1.85"
+publish = false
+
+[workspace.dependencies]
+liu-abi = { path = "crates/liu-abi" }
+liu-elf = { path = "crates/liu-elf" }
+liu-platform = { path = "crates/liu-platform" }
+libc = "0.2.180"
+
+# The project uses KNF (see docs/style.md). These lints contradict it.
+[workspace.lints.rust]
+unused_parens = "allow"
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+needless_return = "allow"
+unused_unit = "allow"
+let_and_return = "allow"
+redundant_closure = "allow"
+redundant_field_names = "allow"
+undocumented_unsafe_blocks = "warn"
+
+[profile.release]
+panic = "abort"

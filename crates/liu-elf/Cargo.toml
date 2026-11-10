@@ -1,0 +1,11 @@
+[package]
+name = "liu-elf"
+description = "ELF64 parsing and load planning for the LIU kernel image"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
