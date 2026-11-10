@@ -44,8 +44,9 @@ LIU is an **official Renux component** in three parts:
 - The Renux base stays Zig-only, free of Linux code and free of GPL code.
 - Renux users install LIU with one command and get the fast path automatically.
 - LIU's CI covers FreeBSD and Linux as well, which also protects Renux.
-- `PT_SET_SC_RET` must be committed to the Renux tree with its tests; today it
-  exists only in a local working tree.
+- `PT_SET_SC_RET` is in the Renux tree (commit `cb1ed96`). Its tests still live
+  in LIU (`crates/liu-platform/tests/renux_set_sc_ret.rs`); a copy belongs in
+  Renux's own test suite.
 - A Renux release can document LIU as its way to run Linux software. Whether the
   linuxulator (`COMPAT_LINUX`) is later dropped from Renux is a separate
   decision, to take once LIU reaches M5.

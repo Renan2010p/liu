@@ -675,7 +675,7 @@ are generic (D5).
 
 | Primitive | Used by | Status |
 |---|---|---|
-| `PT_SET_SC_RET` (ptrace request 45: skip the syscall, set its result) | `renux-setscret` | Verified on the running 15.1-RELEASE-p6 kernel; still uncommitted in the Renux tree |
+| `PT_SET_SC_RET` (ptrace request 45: skip the syscall, set its result) | `renux-setscret` | In the Renux tree (`renuxproject/renux` commit `cb1ed96`); verified on the running kernel |
 | `trapvec`: syscall redirection to a supervisor through shared memory | `trapvec` | Design (M6) |
 
 ## 15. Testing strategy
