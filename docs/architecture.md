@@ -2,275 +2,336 @@
 
 | | |
 |---|---|
-| **Status** | Draft, revision 1 |
-| **Scope** | LIU host runtime, host ABI, kernel port, devices, build, roadmap |
+| **Status** | Draft, revision 2 |
+| **Scope** | Host runtime, host ABI, platform layer, kernel port, devices, build, roadmap |
 | **Supersedes** | The Phase 0 prototype (`liu` repository, commit `73410a5`) |
-| **License** | MPL-2.0 (LIU code); GPL-2.0 (Linux kernel and its patches) |
+| **License** | MPL-2.0 for LIU code; GPL-2.0-only for the Linux kernel and its patches |
+
+## Contents
+
+1. [Summary](#1-summary)
+2. [Goals and non-goals](#2-goals-and-non-goals)
+3. [Lessons from the Phase 0 prototype](#3-lessons-from-the-phase-0-prototype)
+4. [Key design decisions](#4-key-design-decisions)
+5. [Execution model](#5-execution-model)
+6. [Host ABI](#6-host-abi)
+7. [Platform layer and trap backends](#7-platform-layer-and-trap-backends)
+8. [Devices](#8-devices)
+9. [Kernel side](#9-kernel-side)
+10. [Rust workspace](#10-rust-workspace)
+11. [Command line and configuration](#11-command-line-and-configuration)
+12. [Security model](#12-security-model)
+13. [Performance model](#13-performance-model)
+14. [Renux kernel primitives](#14-renux-kernel-primitives)
+15. [Testing strategy](#15-testing-strategy)
+16. [Roadmap](#16-roadmap)
+17. [Licensing](#17-licensing)
+18. [Risks and open questions](#18-risks-and-open-questions)
+19. [LIU and Renux](#19-liu-and-renux)
 
 ---
 
 ## 1. Summary
 
-LIU (**Linux In Userspace**) runs an unmodified, real Linux kernel as an ordinary
-unprivileged process on Renux and on other Unix systems: FreeBSD, Linux,
-NetBSD and macOS among them. Linux applications run *on that kernel*, not on the
-host: their system calls are serviced by real Linux code. The host provides only
-the "hardware" — memory, CPU time, timers, interrupts, and devices — through a
-small, versioned, Linux-agnostic **host ABI** implemented in Rust. Renux is the
-reference platform and gets dedicated fast paths; every other host is reached
-through a portable platform layer (§7).
+LIU (**Linux In Userspace**) runs an unmodified, real Linux kernel as an
+ordinary unprivileged process on Renux and on other Unix systems: FreeBSD,
+Linux, NetBSD and macOS among them. Linux applications run *on that kernel*,
+not on the host: their system calls are serviced by real Linux code. The host
+provides only the "hardware" — memory, CPU time, timers, interrupts and devices
+— through a small, versioned, Linux-agnostic **host ABI** implemented in Rust.
 
-This is the opposite of the FreeBSD linuxulator. The linuxulator translates each
-Linux system call into a native one inside the host kernel, which leaves many
+This is the opposite of the FreeBSD linuxulator, which translates each Linux
+system call into a native one inside the host kernel and so leaves many
 interfaces missing or stubbed (`io_uring`, `bpf`, namespaces, cgroups,
 `pidfd_*`, `userfaultfd`, `fanotify`, ...). LIU translates nothing at the
-syscall level. It virtualizes the machine underneath Linux, so every Linux
-interface the kernel supports is available, and the Renux kernel carries no
-Linux code.
+syscall level. It virtualizes the machine underneath Linux, so every interface
+the Linux kernel supports is available, and the host kernel carries no Linux
+code.
 
-```
-        Linux applications (unmodified ELF, glibc or musl)
-                         │  Linux syscalls (trapped, never executed by the host)
-        ┌────────────────▼─────────────────────────────────┐
-        │  Linux kernel (upstream arch/um, freestanding)   │  GPL-2.0, C
-        │  VFS · scheduler · net stack · io_uring · eBPF   │
-        ├──────────────────────────────────────────────────┤
-        │  os-liu: thin C shim over the host ABI           │  GPL-2.0, C
-        └────────────────┬─────────────────────────────────┘
-                         │  LIU host ABI (#[repr(C)] function tables)
-        ┌────────────────▼─────────────────────────────────┐
-        │  liu-runtime: memory · guest processes · traps · │  MPL-2.0, Rust
-        │  timers · interrupts · event loop                │
-        ├──────────────────────────────────────────────────┤
-        │  Device backends (vhost-user, separate processes)│  MPL-2.0, Rust
-        │  console · block · net · fs                      │
-        └────────────────┬─────────────────────────────────┘
-        ├──────────────────────────────────────────────────┤
-        │  liu-platform: the only host-specific code       │  MPL-2.0, Rust
-        └────────────────┬─────────────────────────────────┘
-                         │  native host syscalls (ptrace, shm, kqueue/epoll, sandbox)
-        ┌────────────────▼─────────────────────────────────┐
-        │  Host kernel: Renux · FreeBSD · Linux · NetBSD · │
-        │  macOS ... (no Linux compatibility code needed)  │
-        └──────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph guest["Guest — GPL-2.0, C"]
+        apps["Linux applications<br/>unmodified ELF, glibc or musl"]
+        linux["Linux kernel, upstream arch/um<br/>VFS · scheduler · net stack · io_uring · eBPF"]
+        oslu["os-liu<br/>thin shim over the host ABI"]
+    end
+    subgraph liu["LIU — MPL-2.0, Rust"]
+        runtime["liu-runtime<br/>memory · guest processes · traps · timers · IRQs"]
+        devices["device backends<br/>console · block · net · fs"]
+        platform["liu-platform<br/>the only host-specific code"]
+    end
+    host[("Host kernel<br/>Renux · FreeBSD · Linux · NetBSD · macOS")]
+
+    apps -- "Linux syscalls<br/>trapped, never run by the host" --> linux
+    linux --> oslu
+    oslu -- "host ABI<br/>C function tables" --> runtime
+    linux -. "virtio over vhost-user" .-> devices
+    runtime --> platform
+    devices --> platform
+    platform -- "ptrace · shm · kqueue/epoll · sandbox" --> host
 ```
 
 ## 2. Goals and non-goals
 
 ### Goals
 
-1. Run unmodified Linux binaries against a **real** Linux kernel on Renux and other Unix hosts.
+1. Run unmodified Linux binaries against a **real** Linux kernel on Renux and
+   other Unix hosts.
 2. Keep the Renux kernel free of Linux-specific code. Any kernel support LIU
    needs must be a generic, independently useful primitive.
 3. Write every component LIU authors in **Rust**, and keep the unavoidable C
-   (code that lives inside the Linux tree) as small and mechanical as possible.
-4. Run unprivileged and confined: no root, no kernel module, Capsicum-sandboxed.
+   (code that lives inside the Linux tree) small and mechanical.
+4. Run unprivileged and confined: no root, no kernel module, sandboxed.
 5. Track an upstream Linux LTS release with a small, rebasable patch series.
 6. **Portability.** Run on any Unix host that offers a way to intercept a
-   process's system calls. Host-specific code is confined to the platform layer;
-   the kernel image, the host ABI and the device backends are identical on
-   every host.
+   process's system calls. Host-specific code is confined to the platform
+   layer; the kernel image, the host ABI and the device backends are identical
+   on every host.
 
 ### Non-goals
 
 - Reimplementing the Linux syscall surface (the gVisor approach).
 - Translating Linux syscalls into host syscalls (the linuxulator approach).
-- Hardware virtualization. bhyve already covers that; LIU must work without
-  VT-x and inside jails.
+- Hardware virtualization as a requirement. bhyve already covers that; LIU must
+  work without VT-x and inside jails.
 - Graphics acceleration in the first releases.
 
 ## 3. Lessons from the Phase 0 prototype
 
-The prototype proved the concept and identified exactly where it broke. This
-design is shaped by those results.
+The prototype proved the concept and found exactly where it broke. This design
+is shaped by those results.
 
-| Finding | Consequence for this design |
+| Finding | Consequence |
 |---|---|
-| A real UML 6.12 kernel boots on a real Linux host, and a Rust guest benchmark runs inside it. | The execution model (Linux kernel as a process) is sound. Keep `arch/um`. |
+| A real UML 6.12 kernel boots on a real Linux host, and a Rust guest benchmark runs inside it. | The execution model is sound. Keep `arch/um`. |
 | Booting under the linuxulator fails: `PTRACE_SYSEMU` is missing and `PTRACE_POKEUSER` is broken there. | Never depend on a host's Linux emulation. Use native host primitives only. |
-| `PT_SET_SC_RET` was added to the Renux kernel as a generic ptrace request and verified (`ptrace-setscret-test.c`, `sysemu-test.c`). | This is the trap primitive for the first backend. It is generic and stays. |
-| `arch/x86/um/user-offsets.c` and `os-Linux` collide with FreeBSD libc headers; a dozen shims (`epoll`, `sys/vfs.h`, `pty.h`, ...) were needed. | Stop compiling Linux host code against the host libc at all. |
+| `PT_SET_SC_RET` was added to the Renux kernel as a generic ptrace request and verified. | This is the trap primitive of the Renux backend. It is generic and stays. |
+| `arch/x86/um/user-offsets.c` and `os-Linux` collide with FreeBSD libc headers; a dozen shims were needed. | Stop compiling Linux host code against the host libc. |
 | The natively built UML binary aborts before `main`: the UML linker script is incompatible with the FreeBSD C runtime. | Stop linking the kernel as a host libc program. Load it ourselves. |
-| The host-side C port (`os-Renux`) grew to many files of libc emulation. | Move host logic into Rust behind a narrow ABI; the C side only forwards. |
+| The host-side C port (`os-Renux`) grew into many files of libc emulation. | Move host logic into Rust behind a narrow ABI; the C side only forwards. |
 
-The central change is therefore: **the Linux kernel becomes a freestanding image
-loaded and hosted by a Rust runtime**, instead of a FreeBSD executable linked
-against libc.
+The central change: **the Linux kernel becomes a freestanding image loaded and
+hosted by a Rust runtime**, instead of a host executable linked against libc.
 
 ## 4. Key design decisions
 
-Each decision has an ADR in [`adr/`](adr/).
+Each decision has an [ADR](adr/).
 
 | # | Decision | ADR |
 |---|---|---|
 | D1 | Run the real Linux kernel in user space, based on upstream `arch/um`. | [0001](adr/0001-real-linux-kernel-in-userspace.md) |
-| D2 | Build the kernel freestanding; a Rust runtime loads it and provides host services through `#[repr(C)]` function tables. | [0002](adr/0002-freestanding-kernel-rust-runtime.md) |
+| D2 | Build the kernel freestanding; a Rust runtime loads it and serves it through C function tables. | [0002](adr/0002-freestanding-kernel-rust-runtime.md) |
 | D3 | Devices are vhost-user backends in separate Rust processes, driven by the upstream `virtio_uml` driver. | [0003](adr/0003-devices-via-vhost-user.md) |
-| D4 | Guest syscall trapping sits behind a `TrapBackend` trait. Backend 1 is native ptrace with `PT_SET_SC_RET`. | [0004](adr/0004-pluggable-trap-backends.md) |
+| D4 | Guest syscall trapping sits behind a `TrapBackend` trait. | [0004](adr/0004-pluggable-trap-backends.md) |
 | D5 | Renux kernel changes must be generic primitives with no Linux knowledge. | [0005](adr/0005-no-linux-code-in-renux.md) |
-| D6 | LIU is portable across Unix hosts through a platform layer; Renux is the reference platform with runtime-detected fast paths. | [0006](adr/0006-portable-platform-layer.md) |
+| D6 | LIU is portable through a platform layer; Renux is the reference platform with runtime-detected fast paths. | [0006](adr/0006-portable-platform-layer.md) |
+| D7 | LIU is an official Renux component, delivered as a package, outside the Zig-built base system. *(proposed)* | [0007](adr/0007-liu-as-a-renux-component.md) |
 
 ## 5. Execution model
 
 ### 5.1 Processes
 
-A running LIU instance consists of the following host processes:
+A running LIU instance is a small tree of ordinary host processes:
 
-```
-liu (supervisor, Rust)                          ── pdfork, Capsicum
- ├── liu-kernel  (runtime + Linux kernel image) ── one process, N host threads
- │    ├── guest mm #1   (Linux process A)       ── traced by liu-kernel
- │    ├── guest mm #2   (Linux process B)
- │    └── ...
- ├── liu-dev-console   (vhost-user backend)
- ├── liu-dev-blk       (vhost-user backend)
- ├── liu-dev-net       (vhost-user backend)
- └── liu-dev-fs        (vhost-user backend)
+```mermaid
+flowchart TB
+    sup["liu<br/>supervisor"]
+    kern["liu-kernel<br/>runtime + Linux kernel image"]
+    g1["guest space 1<br/>Linux process A"]
+    g2["guest space 2<br/>Linux process B"]
+    gn["guest space n"]
+    con["liu-dev-console"]
+    blk["liu-dev-blk"]
+    net["liu-dev-net"]
+    fs["liu-dev-fs"]
+
+    sup -- "pdfork" --> kern
+    sup -- "pdfork" --> con & blk & net & fs
+    kern -- "trace" --> g1 & g2 & gn
+    kern -. "vhost-user" .- con & blk & net & fs
 ```
 
-- **Supervisor** (`liu`): parses configuration, creates the shared memory
-  objects and device sockets, spawns everything with `pdfork(2)`, holds the
-  process descriptors, and owns lifecycle and logging. It never runs guest code.
-- **Kernel process** (`liu-kernel`): the Rust runtime plus the Linux kernel image
+- **Supervisor** (`liu`): reads the configuration, opens every host resource,
+  creates the shared memory and device sockets, spawns everything with process
+  descriptors, and owns lifecycle and logging. It never runs guest code.
+- **Kernel process** (`liu-kernel`): the Rust runtime with the Linux kernel image
   mapped into the same address space. Linux kernel code runs here.
-- **Guest address-space processes**: one host process per Linux `mm_struct`
-  (or one vCPU address space with the `hvf`/`kvm` backends). Linux user code
-  runs here. Every syscall it makes is trapped and handed to the Linux kernel;
-  the host never executes it.
-- **Device backends**: one process per device class, each with only the
-  capabilities it needs (a file descriptor for a disk image, a `tap(4)`
-  descriptor, a directory descriptor).
+- **Guest spaces**: one host process per Linux `mm_struct` (or one vCPU address
+  space with the `hvf` and `kvm` backends). Linux user code runs here. Every
+  system call it makes is trapped and handed to the Linux kernel.
+- **Device backends**: one process per device, each holding exactly the
+  resource it serves (a disk image, a directory, a network descriptor).
 
 ### 5.2 Guest physical memory
 
-Guest "physical" RAM is a single anonymous shared memory object, created by
-the platform layer (`shm_open(SHM_ANON)` on Renux/FreeBSD, `memfd_create` on
-Linux; see §7.5). It is mapped:
+Guest "physical" RAM is one anonymous shared memory object, created by the
+platform layer (§7.5) and mapped by everyone who needs it. No page is ever
+copied across the boundary.
 
-- into the kernel process as the kernel's linear map;
-- into each guest process, page by page, as directed by the Linux kernel's page
-  tables (UML's model: user mappings are `mmap` of offsets in the physmem
-  object);
-- into device backends, which receive the descriptor over the vhost-user socket
-  and perform DMA-style access directly.
+```mermaid
+flowchart LR
+    phys[("physmem<br/>anonymous shared memory")]
+    kern["liu-kernel<br/>linear map at boot.physmem_base"]
+    guest["guest spaces<br/>pages mapped as Linux page tables say"]
+    dev["device backends<br/>DMA-style access to virtqueues"]
 
-No page is copied across the boundary. A page fault in a guest process becomes a
-`SIGSEGV` stop, the trap backend reports it to the kernel, Linux resolves it in
-its own page tables, and the runtime applies the resulting mapping in the guest
-process.
+    phys --- kern
+    phys --- guest
+    phys --- dev
+```
+
+A page fault in a guest space becomes a trap. Linux resolves it in its own page
+tables, and the runtime applies the resulting mapping in the guest space.
 
 ### 5.3 Guest address-space operations
 
-Mapping changes inside a guest process are performed by a small **stub** mapped
-at a fixed address in every guest process (as in upstream UML). The runtime
-writes a batch of `mmap`/`munmap`/`mprotect` requests into the stub's shared data
-page and resumes the stub, which executes them natively and traps back. Batching
-keeps the number of context switches per `execve`/`mmap` low.
+Mapping changes inside a guest space are performed by a small **stub** mapped
+at a fixed address in every guest process, as in upstream UML. The runtime
+queues `mmap`, `munmap` and `mprotect` requests in the stub's shared data page
+and resumes the stub, which executes them natively and traps back. Batching
+keeps the number of context switches per `execve` or `mmap` low.
 
-The stub is a few hundred bytes of position-independent code generated from Rust
-(`#![no_std]`, `#[naked]` functions) and embedded in the runtime.
+The stub is a few hundred bytes of position-independent code written in
+`no_std` Rust and embedded in the runtime.
 
 ### 5.4 System call path
 
-```
-guest process            trap backend          liu-runtime            Linux kernel
-     │ syscall                 │                     │                      │
-     ├────────────────────────►│ stop (SCE)          │                      │
-     │                         ├────────────────────►│ read regs            │
-     │                         │                     ├─────────────────────►│ kernel_ops.trap(SYSCALL, regs)
-     │                         │                     │                      │ (real Linux syscall code)
-     │                         │                     │◄─────────────────────┤ return regs / mm ops
-     │                         │ skip + set retval   │ flush stub batch     │
-     │◄────────────────────────┤ (PT_SET_SC_RET)     │                      │
-     │ continues               │                     │                      │
+```mermaid
+sequenceDiagram
+    autonumber
+    participant G as Guest process
+    participant T as Trap backend
+    participant R as liu-runtime
+    participant L as Linux kernel
+
+    G->>T: syscall instruction
+    T->>R: stopped at syscall entry
+    R->>L: as_run returns TRAP_SYSCALL + registers
+    Note over L: real Linux syscall code<br/>VFS, sockets, futex, io_uring ...
+    L->>R: as_map / as_unmap batch, new registers
+    R->>T: flush stub batch, set result
+    T->>G: skip host execution, return result
+    Note over G,T: Renux: one stop with PT_SET_SC_RET
 ```
 
 ### 5.5 Kernel threads, interrupts and time
 
-- The Linux kernel runs uniprocessor (`CONFIG_SMP=n`) on one **vCPU host
-  thread**. SMP is a later milestone.
-- Host events (timers, device notifications, console input) are collected by an
-  **event thread** using the platform event loop (`kqueue` or `epoll`).
-- The event thread posts interrupt numbers into a lock-free pending bitmap and
-  sends a signal to the vCPU thread. The runtime's signal handler calls
-  `kernel_ops.irq()`, which enters Linux's interrupt path exactly as UML does
-  for `SIGIO`/`SIGALRM` today.
-- The Linux kernel never calls `sigaction`, `timer_create`, `kqueue` or `epoll` itself.
-  It asks the runtime through the host ABI.
+- The Linux kernel runs uniprocessor on one **vCPU host thread**. SMP comes later.
+- Host events (timers, device kicks, console input) are collected by an **event
+  thread** using the platform event loop.
+- The event thread records pending interrupts in a lock-free bitmap and signals
+  the vCPU thread. The runtime's handler calls `kernel_ops.irq()`, which enters
+  Linux's interrupt path the way UML does for `SIGIO` and `SIGALRM` today.
+- The Linux kernel never calls `sigaction`, `timer_create`, `kqueue` or `epoll`
+  itself. It asks the runtime through the host ABI.
+
+```mermaid
+sequenceDiagram
+    participant H as Host kernel
+    participant E as Event thread
+    participant V as vCPU thread
+    participant L as Linux kernel
+
+    L->>V: timer_set(deadline)
+    V->>E: arm one-shot timer
+    L->>V: idle()
+    Note over V: blocked
+    H-->>E: timer expired
+    E->>E: set bit in pending bitmap
+    E-->>V: signal
+    V->>L: kernel_ops.timer()
+    Note over L: scheduler tick,<br/>wake-ups, softirqs
+```
 
 ## 6. Host ABI
 
-The host ABI is the only interface between Linux and the host. It is defined once,
-in Rust, in `liu-abi`, and a C header (`include/liu/host.h`) is generated from it
-with `cbindgen`. Both sides are checked against the same layout in CI.
+The host ABI is the only interface between Linux and the host. It is defined
+once, in Rust, in `crates/liu-abi`; the C header
+`kernel/os-liu/include/liu/host.h` is generated from it with `cbindgen` and
+never edited by hand. `cargo xtask check-abi` compiles a C program against the
+header and verifies that every size, alignment, field offset and constant
+matches the Rust definitions.
 
 ### 6.1 Shape
 
-Two function tables, exchanged at entry:
+Two function tables are exchanged at entry:
 
 ```c
-/* Generated from liu-abi. SPDX-License-Identifier: MPL-2.0 OR GPL-2.0-only */
-struct liu_host_ops;    /* kernel -> runtime: services the host provides      */
-struct liu_kernel_ops;  /* runtime -> kernel: entry points Linux registers    */
+/* SPDX-License-Identifier: MPL-2.0 OR GPL-2.0-only */
+struct liu_host_ops;    /* kernel -> runtime: services the host provides */
+struct liu_kernel_ops;  /* runtime -> kernel: entry points Linux registers */
 
-/* Entry point of the freestanding Linux image. */
-int liu_kernel_entry(const struct liu_host_ops *host,
-                     struct liu_kernel_ops *kernel,
-                     const struct liu_boot_info *boot);
+/* ELF entry point of the freestanding kernel image. */
+liu_status liu_kernel_entry(const struct liu_host_ops *host,
+                            struct liu_kernel_ops *kernel,
+                            const struct liu_boot_info *boot);
 ```
 
 Every table begins with a header:
 
 ```rust
 #[repr(C)]
-pub struct TableHeader {
-    pub magic: u32,        // b"LIU\0"
-    pub abi_major: u16,    // incompatible changes
-    pub abi_minor: u16,    // additive changes
-    pub size: u32,         // size_of::<Table>(), for forward compatibility
-    pub _reserved: u32,
+pub struct TableHeader
+{
+    pub magic: u32,      // b"LIU\0"
+    pub abi_major: u16,  // incompatible changes
+    pub abi_minor: u16,  // additive changes
+    pub size: u32,       // size of the table as its producer compiled it
+    pub reserved: u32,
 }
 ```
 
-The runtime refuses to start a kernel whose `abi_major` differs. A newer minor
-version is accepted; entries beyond `size` are treated as absent.
+```mermaid
+flowchart LR
+    hdr["received table header"] --> magic{"magic is LIU?"}
+    magic -- no --> inv["reject: STATUS_INVALID"]
+    magic -- yes --> major{"same major?"}
+    major -- no --> ver["reject: STATUS_VERSION"]
+    major -- yes --> size{"entry inside size<br/>and not null?"}
+    size -- no --> absent["treat entry as absent"]
+    size -- yes --> call["call it"]
+```
 
-### 6.2 `liu_host_ops` groups
+New entries are appended at the end and raise the minor version; an older peer
+simply does not see them.
+
+### 6.2 `liu_host_ops`
 
 The authoritative definition is `crates/liu-abi/src/host_ops.rs`.
 
 | Group | Operations | Notes |
 |---|---|---|
-| **console** | `log_write`, `panic` | Early boot output before devices exist. `panic` does not return. |
+| **console** | `log_write`, `panic` | Early boot output. `panic` does not return. |
 | **kernel memory** | `kmap`, `kunmap`, `kprotect` | Map physmem ranges at kernel-chosen addresses. Physmem itself is mapped at `boot.physmem_base` before entry. |
-| **address spaces** | `as_create`, `as_destroy`, `as_map`, `as_unmap`, `as_protect`, `as_flush` | Guest address spaces; changes are batched until `as_flush` or `as_run`. |
-| **execution** | `as_run(space, regs, event)`, `as_get_fpu`, `as_set_fpu` | Run guest user code until the next trap. TLS bases are part of `GuestRegs`. |
+| **address spaces** | `as_create`, `as_destroy`, `as_map`, `as_unmap`, `as_protect`, `as_flush` | Changes are batched until `as_flush` or `as_run`. |
+| **execution** | `as_run`, `as_get_fpu`, `as_set_fpu` | Run guest user code until the next trap. TLS bases are part of `GuestRegs`. |
 | **cpu** | `irq_enable`, `irq_disable`, `irq_save`, `irq_restore`, `idle` | `idle` blocks the vCPU until an interrupt is pending. |
 | **time** | `clock_monotonic`, `clock_realtime`, `timer_set`, `timer_cancel` | Nanoseconds; tickless one-shot deadline. |
-| **stacks** | `kstack_alloc`, `kstack_free` | Stacks for Linux kernel threads, switched inside the vCPU thread. |
+| **stacks** | `kstack_alloc`, `kstack_free` | Stacks for Linux kernel threads. |
 | **random** | `get_random` | Host entropy. |
-| **devices** | `dev_connect`, `chan_send`, `chan_recv`, `event_create`, `event_signal`, `irq_bind`, `handle_close` | `dev_connect` takes a device *name* from the supervisor configuration, never a path. Channels carry vhost-user messages; handles travel out of band. |
+| **devices** | `dev_connect`, `chan_send`, `chan_recv`, `event_create`, `event_signal`, `irq_bind`, `handle_close` | `dev_connect` takes a device *name* from the supervisor configuration, never a path. Handles travel out of band. |
 
 Rules:
 
-- Status codes are a closed `#[repr(i32)]` enum defined in `liu-abi`. Host
+- Status codes are plain `i32` values from a fixed list (`STATUS_*`). Host
   `errno` values never cross the boundary.
-- Pointers passed to the host ABI are kernel virtual addresses in the kernel
-  process. Guest user memory is accessed only through physmem.
+- Pointers are kernel virtual addresses in the kernel process. Guest user
+  memory is reached only through physmem.
 - No operation names a file path, a socket address or a Linux structure.
+- Rust enums never cross the boundary; values received from the other side are
+  validated integers.
 
 ### 6.3 `liu_kernel_ops`
 
 | Entry | Called when |
 |---|---|
-| `irq(pending_mask)` | the event thread raised one or more interrupts |
+| `irq(pending)` | the event thread raised one or more interrupts |
 | `timer()` | the one-shot deadline expired |
-| `kernel_fault(addr, access, ip)` | a fault occurred in kernel code (e.g. vmalloc area) |
-| `shutdown(reason)` | the supervisor requests an orderly power-off |
+| `kernel_fault(addr, access, ip)` | a fault occurred in kernel code |
+| `shutdown(reason)` | the supervisor requests a power-off or reboot |
 
-Guest traps (syscalls, faults, signals) are not callbacks: they are the return
-value of `as_run`, which keeps the control flow identical to UML's `userspace()`
-loop.
+Guest traps are not callbacks: they are the result of `as_run`, which keeps the
+control flow identical to UML's `userspace()` loop.
 
 ### 6.4 Trap events
 
@@ -287,9 +348,8 @@ pub struct TrapEvent
 }
 ```
 
-Registers are not part of the event: `as_run` updates the caller's
-`GuestRegs` in place. Kinds are plain integers rather than a Rust enum, so an
-unexpected value from the other side is an error, not undefined behavior.
+Registers are not part of the event: `as_run` updates the caller's `GuestRegs`
+in place.
 
 ## 7. Platform layer and trap backends
 
@@ -297,47 +357,65 @@ unexpected value from the other side is an error, not undefined behavior.
 
 Everything above the platform layer is host-independent:
 
-- The kernel image is a freestanding ELF that links against no host library
-  and uses the System V AMD64 calling convention, which every x86_64 Unix
-  shares. The same image runs on every host.
-- The host ABI, the device protocol (vhost-user) and the device backends are
-  identical on every host.
+- The kernel image is a freestanding ELF that links against no host library and
+  uses the System V AMD64 calling convention, which every x86_64 Unix shares.
+  The same image runs on every host.
+- The host ABI, the device protocol and the device backends are identical on
+  every host.
 
-Everything host-specific lives in `liu-platform`, which defines traits and
-provides one implementation per host. No other crate may use
+Everything host-specific lives in `liu-platform`. No other crate may use
 `#[cfg(target_os = ...)]`.
 
+```mermaid
+flowchart TB
+    api["liu-platform API<br/>probe · SharedMemory · fork · sandbox · trap backends"]
+    api --> fb["freebsd<br/>Renux and FreeBSD"]
+    api --> lx["linux<br/>glibc and musl"]
+    api --> gen["generic POSIX<br/>NetBSD · DragonFly · macOS · OpenBSD · illumos"]
+    fb --> rx["renux<br/>runtime-detected extensions"]
+```
+
+Implemented in M0: `probe`, `SharedMemory`, `fork` with process descriptors,
+the Capsicum sandbox, FreeBSD ptrace wrappers and the Renux `PT_SET_SC_RET`
+primitive. The trap backends and the event loop arrive in M1 and M2, with this
+shape:
+
 ```rust
-pub trait Platform
-{
-    type Memory: SharedMemory;   // physmem object: SHM_ANON, memfd, shm_open
-    type Space: GuestSpace;      // one guest address space
-    type Trap: TrapBackend<Space = Self::Space>;
-    type Events: EventLoop;      // kqueue, epoll
-    type Sandbox: Sandbox;       // Capsicum, Landlock+seccomp, sandbox_init
-
-    fn
-    probe() -> Result<Capabilities, Error>;
-}
-
 pub trait TrapBackend
 {
     type Space;
 
     fn
-    create_space(&mut self, physmem: &dyn SharedMemory) -> Result<Self::Space, Error>;
+    create_space(&mut self, physmem: &SharedMemory) -> io::Result<Self::Space>;
 
     fn
-    run(&mut self, space: &mut Self::Space, regs: &mut GuestRegs) -> Result<TrapEvent, Error>;
+    run(&mut self, space: &mut Self::Space, regs: &mut GuestRegs) -> io::Result<TrapEvent>;
 }
 ```
 
-`Platform::probe()` runs at startup and selects the fastest backend the running
-host supports. A Renux kernel is detected as FreeBSD plus extensions, so a
-stock FreeBSD build of LIU automatically uses the Renux fast path when it runs
-on Renux.
+### 7.2 Choosing a trap backend
 
-### 7.2 Host requirements
+`liu_platform::probe()` runs once at startup and lists what the host offers,
+fastest first. A Renux kernel is detected as FreeBSD plus extensions, so one
+FreeBSD build of LIU uses the Renux fast path whenever it runs on Renux.
+
+```mermaid
+flowchart TD
+    start(["probe()"]) --> os{"uname sysname"}
+    os -- FreeBSD --> sc{"PT_SET_SC_RET<br/>works on a test child?"}
+    sc -- yes --> renux["renux-setscret<br/>1 stop per syscall"]
+    sc -- no --> rewrite["freebsd-rewrite<br/>2 stops per syscall"]
+    renux -. fallback .-> rewrite
+    os -- Linux --> kvm{"is /dev/kvm usable?"}
+    kvm -- yes --> kvmb["kvm"]
+    kvm -- no --> sysemu["linux-sysemu"]
+    kvmb -. fallback .-> sysemu
+    os -- NetBSD --> nb["netbsd-syscallemu"]
+    os -- Darwin --> hvf["hvf, Intel only"]
+    os -- other --> none["no backend"]
+```
+
+### 7.3 Host requirements
 
 A host can run LIU when it is **x86_64** and offers:
 
@@ -346,29 +424,28 @@ A host can run LIU when it is **x86_64** and offers:
 2. shared memory that can be mapped into several processes;
 3. a readiness-based event mechanism.
 
-Requirements 2 and 3 are met by every modern Unix. Requirement 1 decides the
-trap backend.
+Every modern Unix meets 2 and 3. Requirement 1 decides the trap backend.
 
-### 7.3 Trap backends
+### 7.4 Trap backends
 
 | Backend | Hosts | Mechanism | Stops per syscall | Status |
-|---|---|---|---|---|
-| `renux-setscret` | Renux | `PT_TO_SCE`, then `PT_SET_SC_RET` skips the call and sets the result | 1 | Kernel primitive implemented and verified |
-| `freebsd-rewrite` | FreeBSD, DragonFly | `PT_TO_SCE`, rewrite the call to a harmless one, then `PT_TO_SCX` and set the result with `PT_SETREGS` | 2 | To validate on stock FreeBSD |
-| `linux-sysemu` | Linux | `PTRACE_SYSEMU` (what upstream UML uses) | 1 | Proven upstream |
-| `netbsd-syscallemu` | NetBSD | `PT_SYSCALL` + `PT_SYSCALLEMU` | 1 | To validate |
-| `hvf` | macOS (Intel) | Hypervisor.framework: guest processes run in ring 3 of a vCPU whose page tables map physmem; `syscall` exits to the runtime. No VM, no guest firmware: only guest user code runs in the vCPU | 0 (VM exit) | Design |
-| `kvm` | Linux | Same as `hvf`, through `/dev/kvm` (the gVisor KVM platform model) | 0 (VM exit) | Design |
-| `trapvec` | Renux | Generic Renux syscall-redirection primitive: a marked process's syscalls are written to a shared-memory mailbox | 0 (mailbox) | Design (M6) |
+|---|---|---|:---:|---|
+| `renux-setscret` | Renux | `PT_TO_SCE`, then `PT_SET_SC_RET` skips the call and sets the result | 1 | Primitive verified from Rust |
+| `freebsd-rewrite` | FreeBSD, DragonFly | `PT_TO_SCE`, rewrite the call to a harmless one, `PT_TO_SCX`, set the result with `PT_SETREGS` | 2 | M2 |
+| `linux-sysemu` | Linux | `PTRACE_SYSEMU`, as upstream UML | 1 | M2 |
+| `netbsd-syscallemu` | NetBSD | `PT_SYSCALL` + `PT_SYSCALLEMU` | 1 | M7 |
+| `hvf` | macOS (Intel) | Hypervisor.framework runs only guest user code in ring 3; `syscall` exits to the runtime | 0 | M7 |
+| `kvm` | Linux | the same through `/dev/kvm`, as gVisor's KVM platform | 0 | M6 |
+| `trapvec` | Renux | generic Renux syscall redirection to a supervisor through shared memory | 0 | M6 |
 
-The `trapvec` primitive must remain Linux-agnostic: it delivers raw register
-state and never interprets syscall numbers. It is useful for any user-space
-emulator or sandbox, which is what justifies adding it to Renux (D5).
+`trapvec` must stay Linux-agnostic: it delivers raw register state and never
+interprets syscall numbers, so it is useful to any user-space emulator or
+sandbox (D5).
 
-### 7.4 Support tiers
+### 7.5 Support tiers
 
 | Tier | Meaning | Hosts |
-|---|---|---|
+|:---:|---|---|
 | **1** | Built and tested in CI on every change; release blocker | Renux, FreeBSD, Linux (x86_64) |
 | **2** | Built in CI; tested before releases | NetBSD, DragonFly, macOS on Intel |
 | **3** | Research; no guarantees | OpenBSD, illumos, any arm64 host |
@@ -376,152 +453,163 @@ emulator or sandbox, which is what justifies adding it to Renux (D5).
 Known limits:
 
 - **arm64 hosts** (Apple Silicon, Raspberry Pi, Ampere) need an arm64 port of
-  `arch/um`, which does not exist upstream. The host ABI is designed so that
-  only `GuestRegs` and the trap backends are architecture-specific.
-- **OpenBSD** `ptrace(2)` has no system call stops; a backend would need a new
-  mechanism.
-- **macOS** `ptrace(2)` cannot read registers; the `hvf` backend is the only
-  route and requires the `com.apple.security.hypervisor` entitlement
-  (ad-hoc signing is enough).
+  `arch/um`, which does not exist upstream. Only `GuestRegs` and the trap
+  backends are architecture-specific in LIU itself.
+- **OpenBSD**'s `ptrace(2)` has no system call stops.
+- **macOS**'s `ptrace(2)` cannot read registers; `hvf` is the only route and
+  needs the `com.apple.security.hypervisor` entitlement (ad-hoc signing is
+  enough).
 
-### 7.5 Other host differences
+### 7.6 Other host differences
 
 | Concern | Renux / FreeBSD | Linux | NetBSD | macOS |
 |---|---|---|---|---|
-| Physmem object | `shm_open(SHM_ANON)` | `memfd_create` | `memfd_create` / `shm_open` | `shm_open` + `shm_unlink` |
+| Physmem object | `shm_open(SHM_ANON)` | `memfd_create` | `shm_open` + unlink | `shm_open` + unlink |
 | Event loop | `kqueue` | `epoll` | `kqueue` | `kqueue` |
-| Device kick | `eventfd` | `eventfd` | `eventfd` | `pipe` pair |
-| Process handle | `pdfork` | `pidfd` | `fork` + pid | `fork` + pid |
-| Sandbox | Capsicum, jail | Landlock + seccomp | `chroot` (best effort) | `sandbox_init` (best effort) |
-| Network (default) | user-mode NAT | user-mode NAT | user-mode NAT | user-mode NAT |
-| Network (optional) | `tap(4)` | TUN/TAP | `tap(4)` | `vmnet` |
+| Device kick | `eventfd` | `eventfd` | `eventfd` | pipe pair |
+| Process handle | `pdfork` | `pidfd` | pid | pid |
+| Sandbox | Capsicum, jail | Landlock + seccomp | best effort | `sandbox_init` |
+| Network, default | user-mode NAT | user-mode NAT | user-mode NAT | user-mode NAT |
+| Network, optional | `tap(4)` | TUN/TAP | `tap(4)` | `vmnet` |
 
 ## 8. Devices
 
 LIU reuses the upstream `virtio_uml` driver (`arch/um/drivers/virtio_uml.c`),
-which implements virtio transports over the **vhost-user** protocol. Devices are
-therefore ordinary vhost-user backends, each a separate Rust process:
+which carries virtio over the **vhost-user** protocol. Devices are therefore
+ordinary vhost-user backends, each a separate Rust process.
 
-| Crate | Linux driver | Backend |
-|---|---|---|
-| `liu-dev-console` | `virtio_console` | stdio or `pts(4)` |
-| `liu-dev-blk` | `virtio_blk` | raw image file, ZFS zvol, or `md(4)` via a descriptor |
-| `liu-dev-net` | `virtio_net` | user-mode NAT stack (default, unprivileged, portable); host TAP device (optional) |
-| `liu-dev-fs` | `virtio_fs` / `9p` | a Capsicum directory descriptor (`openat` beneath it only) |
-| `liu-dev-rng` | `virtio_rng` | `getrandom(2)` |
+```mermaid
+flowchart LR
+    subgraph kp["liu-kernel"]
+        drv["Linux virtio drivers<br/>virtio_blk · virtio_net · virtio_fs"]
+        vu["virtio_uml"]
+    end
+    subgraph be["liu-dev-blk"]
+        vh["liu-vhost<br/>message + virtqueue checks"]
+        img[("disk image fd")]
+    end
+    phys[("physmem")]
 
-Shared building blocks live in `liu-vhost` (protocol, virtqueue access over
-physmem). Event loops and kick descriptors come from `liu-platform`, so the
-backends contain no host-specific code.
-
-The device boundary is the security boundary for I/O: a compromised Linux kernel
-can only send vhost-user messages and virtqueue descriptors to backends that
-validate every descriptor against the physmem bounds.
-
-## 9. Kernel side (C, GPL-2.0)
-
-The C code LIU maintains is limited to a patch series against a pinned Linux LTS
-tree:
-
+    drv --> vu
+    vu -- "vhost-user messages<br/>physmem fd, kick and call events" --> vh
+    vu -. "virtqueues" .- phys
+    vh -. "reads descriptors, copies data" .- phys
+    vh --> img
 ```
+
+| Backend | Linux driver | Resource |
+|---|---|---|
+| `liu-dev-console` | `virtio_console` | stdio or a pseudo-terminal |
+| `liu-dev-blk` | `virtio_blk` | raw image file, ZFS zvol or memory disk |
+| `liu-dev-net` | `virtio_net` | user-mode NAT (default, unprivileged); host TAP device (optional) |
+| `liu-dev-fs` | `virtio_fs` or 9p | one directory descriptor; nothing outside it is reachable |
+| `liu-dev-rng` | `virtio_rng` | host entropy |
+
+The device boundary is the I/O security boundary: a compromised Linux kernel can
+only send vhost-user messages and virtqueue descriptors to backends that check
+every descriptor against the physmem bounds.
+
+## 9. Kernel side
+
+The C that LIU maintains (GPL-2.0-only) is a patch series against a pinned
+Linux LTS tree:
+
+```text
 kernel/
   VERSION                     pinned upstream version (6.12.y LTS)
   patches/
     0001-um-add-os-liu-host-layer.patch
     0002-um-freestanding-build-mode.patch
     0003-um-x86-user-offsets-without-host-headers.patch
-    ...
   configs/
     liu_defconfig             UP, virtio_uml, no hostfs, no host libc drivers
-  os-liu/                     source of the host layer (copied into arch/um/)
+  os-liu/
     host.c                    os_* functions forwarding to liu_host_ops
     entry.c                   liu_kernel_entry, table registration
-    include/liu/host.h        generated, never edited
+    include/liu/host.h        generated from liu-abi, never edited
 ```
-
-Principles:
 
 - `os-liu` implements the existing `os_*` contract of `arch/um` by forwarding to
   `liu_host_ops`. It contains no policy and no libc calls.
-- The kernel is built with `-ffreestanding -nostdlib`, linked as a static
-  position-independent ELF with a LIU-specific linker script, and exports only
-  `liu_kernel_entry`. This removes the host libc headers and the host C runtime
-  from the build entirely, which eliminates the two Phase 0 blockers.
-- UML drivers that require host libc (`hostfs`, `ubd`, `net_user`, `mconsole`
-  helpers) are disabled; their roles are filled by vhost-user devices.
-- Patches are kept small and rebased on each LTS point release by CI.
+- The kernel is built with `-ffreestanding -nostdlib`, linked with a LIU linker
+  script, and exports only `liu_kernel_entry`. The host libc and C runtime are
+  out of the build, which removes both Phase 0 blockers.
+- UML drivers that need host libc (`hostfs`, `ubd`, `net_user`) are disabled;
+  vhost-user devices replace them.
+- Patches stay small and are rebased on each LTS point release.
 
 ## 10. Rust workspace
 
-```
-liu-project/
-├── Cargo.toml                 workspace
-├── rust-toolchain.toml
-├── LICENSE                    MPL-2.0
+```text
+liu/
 ├── crates/
-│   ├── liu-abi/               host ABI types, tables, status codes (no_std)
-│   ├── liu-elf/               ELF64 loader for the kernel image (no_std)
-│   ├── liu-platform/          platform traits + one module per host (the only cfg(target_os) code)
-│   │   └── src/{renux,freebsd,linux,netbsd,macos}/
-│   ├── liu-physmem/           bounds-checked guest physical memory access
-│   ├── liu-trap/              guest stub and host-independent trap handling
-│   ├── liu-runtime/           kernel process: loader, host_ops impl, vCPU, event thread
-│   ├── liu-vhost/             vhost-user protocol, virtqueues
-│   ├── liu-dev-console/       device backend binary
-│   ├── liu-dev-blk/           device backend binary
-│   ├── liu-dev-net/           device backend binary
-│   ├── liu-dev-fs/            device backend binary
-│   ├── liu-config/            instance configuration (TOML) and validation
-│   ├── liu-rootfs/            rootfs image tooling
-│   └── liu/                   supervisor and CLI
-├── kernel/                    Linux patch series and os-liu (GPL-2.0)
-├── xtask/                     build orchestration (cargo xtask ...)
-├── tests/                     integration and boot tests
+│   ├── liu-abi/          host ABI types, tables, status codes          no_std  ✅
+│   ├── liu-elf/          ELF64 parser and kernel load planner          no_std  ✅
+│   ├── liu-platform/     the only host-specific code                           ✅
+│   │   └── src/{freebsd/, linux/, generic.rs}
+│   ├── liu-physmem/      bounds-checked guest physical memory access
+│   ├── liu-trap/         guest stub and host-independent trap handling
+│   ├── liu-runtime/      kernel process: loader, host_ops, vCPU, events
+│   ├── liu-vhost/        vhost-user protocol and virtqueues
+│   ├── liu-dev-*/        device backends: console, blk, net, fs, rng
+│   ├── liu-config/       instance configuration
+│   └── liu/              supervisor and CLI
+├── kernel/               Linux patch series and os-liu               GPL-2.0
+├── xtask/                gen-header · check-header · check-abi · style · ci  ✅
+├── tests/                integration and boot tests
 └── docs/
 ```
 
-Crate rules:
+```mermaid
+flowchart LR
+    cli["liu"] --> cfg["liu-config"]
+    cli --> plat["liu-platform"]
+    rt["liu-runtime"] --> abi["liu-abi"]
+    rt --> elf["liu-elf"]
+    rt --> pm["liu-physmem"]
+    rt --> trap["liu-trap"]
+    rt --> plat
+    trap --> abi
+    trap --> pm
+    trap --> plat
+    dev["liu-dev-*"] --> vh["liu-vhost"]
+    vh --> pm
+    vh --> plat
+    xt["xtask"] --> abi
+```
+
+Rules:
 
 - `unsafe` is allowed only in `liu-platform`, `liu-physmem`, `liu-trap` and the
-  `host_ops` glue in `liu-runtime`. Every other crate is `#![forbid(unsafe_code)]`.
+  `host_ops` glue of `liu-runtime`. Other crates use `#![forbid(unsafe_code)]`.
 - `#[cfg(target_os = ...)]` is allowed only in `liu-platform`.
-- `liu-abi` and `liu-elf` are `no_std` so they can also be used by the stub and
-  by test kernels.
-- All Rust code follows the KNF style in [`style.md`](style.md).
-
-### Dependency graph
-
-```
-liu (CLI) ──► liu-config, liu-platform
-liu-runtime ──► liu-abi, liu-elf, liu-physmem, liu-trap, liu-platform
-liu-trap ──► liu-abi, liu-physmem, liu-platform
-liu-dev-* ──► liu-vhost ──► liu-physmem, liu-platform
-```
+- `liu-abi` and `liu-elf` are `no_std`, so the stub and test kernels can use them.
+- All Rust code follows [KNF](style.md).
 
 ## 11. Command line and configuration
 
 ```sh
-liu run --kernel build/linux.liu --rootfs fedora.img -- /bin/bash
+liu run --kernel linux.liu --rootfs arch.img -- /bin/bash
 liu run --config instance.toml
-liu ps | liu stop <name>
+liu ps
+liu stop arch
 ```
 
 ```toml
 [instance]
-name = "fedora"
+name = "arch"
 memory = "2G"
 
 [kernel]
-image = "build/linux.liu"
+image = "/usr/local/share/liu/linux.liu"
 cmdline = "root=/dev/vda rw console=hvc0"
 
 [[device]]
 kind = "blk"
-path = "/var/liu/fedora.img"
+path = "/var/liu/arch.img"
 
 [[device]]
-kind = "net"
-tap = "tap0"
+kind = "net"            # user-mode NAT unless `tap = "tap0"` is given
 
 [[device]]
 kind = "fs"
@@ -532,107 +620,174 @@ read_only = false
 
 ## 12. Security model
 
+```mermaid
+flowchart TB
+    subgraph jail["optional jail or namespaces, resource limits"]
+        sup["supervisor<br/>opens resources, then sandboxes itself"]
+        subgraph sb1["sandbox"]
+            kern["liu-kernel<br/>physmem, sockets, guest handles only"]
+            g["guest spaces<br/>no descriptors, every syscall trapped"]
+        end
+        subgraph sb2["sandbox, one per device"]
+            d["device backend<br/>exactly one resource"]
+        end
+    end
+    sup --> kern
+    sup --> d
+    kern --> g
+    kern -. "checked descriptors" .- d
+```
+
 | Layer | Mechanism |
 |---|---|
-| Supervisor | Opens every host resource up front, then passes descriptors; enters the platform sandbox before starting the kernel. |
-| Kernel process | Platform sandbox (Capsicum capability mode on Renux/FreeBSD, Landlock + seccomp on Linux). Holds only: physmem, vhost sockets, its handles for guest spaces. Cannot open paths or sockets. |
-| Guest processes | Created by the kernel process; every syscall is trapped. Even with a trap-backend bug they run in capability mode with no descriptors. |
-| Device backends | Each in capability mode with exactly one resource (an image fd, a tap fd, a directory fd). Descriptor validation against physmem bounds. |
-| Instance | Optionally inside a jail (Renux/FreeBSD) or namespaces (Linux), with resource limits. |
+| Supervisor | Opens every host resource up front, passes descriptors, then enters the platform sandbox. |
+| Kernel process | Platform sandbox (Capsicum on Renux/FreeBSD; Landlock + seccomp on Linux). Holds physmem, device sockets and guest handles; cannot open paths or sockets. |
+| Guest spaces | Every syscall is trapped. Even with a trap-backend bug they hold no descriptors and run sandboxed. |
+| Device backends | One sandbox each, with exactly one resource. Every descriptor is checked against physmem bounds. |
+| Instance | Optionally a jail (Renux/FreeBSD) or namespaces (Linux), with resource limits. |
 
-A Linux kernel compromise yields control of an unprivileged, sandboxed host
-process. It cannot reach the host kernel through any Linux-specific code path,
-because none exists. The strength of the sandbox depends on the host: it is
-strongest on Renux and FreeBSD (Capsicum) and Linux (Landlock + seccomp), and
-best effort elsewhere.
+A Linux kernel compromise yields an unprivileged, sandboxed host process. It
+cannot reach the host kernel through any Linux-specific code path, because none
+exists. Sandbox strength depends on the host: strongest on Renux, FreeBSD and
+Linux; best effort elsewhere.
 
 ## 13. Performance model
 
 | Path | Crosses to the host? | Cost driver |
 |---|---|---|
 | CPU-bound guest code | no | native speed |
-| Syscall served from Linux caches (`getpid`, cached `read`, pipes, futex) | trap only | trap backend round-trip |
-| Page fault / `mmap` | trap + stub batch | number of mapping changes |
-| Block / network I/O | virtqueue kick | device rate, batched |
-| Timer tick | none (tickless) | one-shot deadlines |
+| Syscall served from Linux caches (`getpid`, cached `read`, pipes, futex) | trap only | trap backend round trip |
+| Page fault, `mmap` | trap + stub batch | number of mapping changes |
+| Block and network I/O | virtqueue kick | device rate, batched |
+| Timer | none between deadlines | one-shot deadlines |
 
-Every milestone records: syscall round-trip latency, page-fault latency,
-`fork`+`exec` time, boot-to-shell time, and memory overhead. The Phase 0
-TCG-emulated reference (≈404 µs per `getpid`) is not representative; the first
-bare-metal numbers on each Tier 1 host are a milestone deliverable.
+Every milestone records syscall round-trip latency, page-fault latency,
+`fork` + `exec` time, boot-to-shell time and memory overhead. The Phase 0
+reference (≈404 µs per `getpid`) ran under TCG emulation and is not
+representative; bare-metal numbers on each Tier 1 host are a milestone
+deliverable.
 
 ## 14. Renux kernel primitives
 
-LIU needs no Renux-specific kernel support to run (stock FreeBSD is a supported
-host). The primitives below are Renux fast paths, detected at runtime. All are
-generic (D5).
+LIU needs no Renux-specific kernel support to run: stock FreeBSD is a supported
+host. The primitives below are Renux fast paths, detected at runtime, and all
+are generic (D5).
 
 | Primitive | Used by | Status |
 |---|---|---|
-| `PT_SET_SC_RET` (request 45: skip syscall, set result) | `renux-setscret` backend | Implemented, verified on 15.1-RELEASE-p6 |
-| `trapvec`: syscall redirection to a supervisor through shared memory | `trapvec` backend | Design (M6) |
+| `PT_SET_SC_RET` (ptrace request 45: skip the syscall, set its result) | `renux-setscret` | Verified on the running 15.1-RELEASE-p6 kernel; still uncommitted in the Renux tree |
+| `trapvec`: syscall redirection to a supervisor through shared memory | `trapvec` | Design (M6) |
 
 ## 15. Testing strategy
 
 | Level | What | Where |
 |---|---|---|
-| Unit | ABI layout, ELF parsing, config validation, vhost-user framing | `cargo test` |
-| ABI conformance | A tiny freestanding **test kernel** (Rust, `no_std`) that exercises every `host_ops` entry and checks results | `tests/abi-kernel/` |
-| Trap backend | Run static test programs in a guest space; verify syscall interception, faults, signals | `tests/trap/` |
-| Boot | Boot `liu_defconfig` to a busybox initramfs, run a scripted shell session | `cargo xtask test-boot` |
-| Compatibility | Selected Linux Test Project (LTP) syscall suites inside the guest | nightly CI |
-| ABI drift | Regenerate `host.h`, fail on diff; compile-time `size_of`/`offset_of` assertions on both sides | CI |
+| Unit | ABI layout and negotiation, ELF validation, style rules | `cargo test` ✅ |
+| Platform | shared memory, processes, Capsicum, `PT_SET_SC_RET` on the running kernel | `crates/liu-platform/tests` ✅ |
+| ABI drift | regenerate `host.h` and fail on diff; compile a C probe and compare every offset | `cargo xtask check-header`, `check-abi` ✅ |
+| ABI conformance | a freestanding Rust test kernel that calls every `host_ops` entry | `tests/abi-kernel/` (M1) |
+| Trap backends | static programs in a guest space: syscalls, faults, signals | `tests/trap/` (M2) |
+| Boot | boot `liu_defconfig` to a busybox initramfs and script a shell session | `cargo xtask test-boot` (M3) |
+| Compatibility | selected Linux Test Project suites inside the guest | nightly (M5) |
 
-The test kernel is important: it lets the runtime be developed and verified
-without building Linux, which takes hours on the development machine.
+The test kernel lets the runtime be built and verified without compiling Linux,
+which takes hours on the development machine.
 
 ## 16. Roadmap
 
+```mermaid
+flowchart LR
+    M0["✅ M0<br/>Foundation"] --> M1["🔨 M1<br/>Runtime +<br/>test kernel"]
+    M1 --> M2["M2<br/>Guest spaces"]
+    M2 --> M3["M3<br/>Linux boots"]
+    M3 --> M4["M4<br/>Devices"]
+    M4 --> M5["M5<br/>Usable system"]
+    M5 --> M6["M6<br/>Performance"]
+    M5 --> M7["M7<br/>More hosts,<br/>GUI, Flatpak"]
+    M6 --> M8["M8<br/>arm64"]
+    M7 --> M8
+
+    style M0 fill:#c8f0c8,stroke:#2e8b2e,color:#000
+    style M1 fill:#fff1b8,stroke:#b38f00,color:#000
+```
+
 | Milestone | Deliverable | Exit criterion |
 |---|---|---|
-| **M0 — Foundation** | Workspace, `liu-abi`, `liu-elf`, `liu-platform` (traits, Renux/FreeBSD and Linux shared memory, probing, Renux `PT_SET_SC_RET` primitive), style checker, CI | `cargo xtask ci` passes on Renux; workspace type-checks for Linux; `host.h` generated and checked |
-| **M1 — Runtime + test kernel** | `liu-runtime` loads a freestanding `no_std` test kernel and serves `log`, `memory`, `time`, `cpu` | ABI conformance suite passes on Renux and Linux |
-| **M2 — Guest spaces** | Trap backends `renux-setscret`, `freebsd-rewrite`, `linux-sysemu`; stub; physmem mappings | A static test binary runs in a guest space on each Tier 1 host; every syscall is trapped and answered by the test kernel |
-| **M3 — Linux boots** | `kernel/` patch series, freestanding `arch/um` build, `os-liu` | `init=/bin/sh` from a busybox initramfs; `uname -a` and `cat /proc/version` work |
-| **M4 — Devices** | `liu-vhost`, console, blk, rng | Root filesystem on `/dev/vda`; interactive console on `hvc0` |
-| **M5 — Usable system** | net, fs, supervisor CLI, Capsicum everywhere | Fedora or Alpine userland boots; package manager installs over the network |
-| **M6 — Performance** | `trapvec` Renux primitive and backend; `kvm` backend; SMP investigation | Measurable syscall latency improvement over the ptrace backends; published benchmarks |
-| **M7 — More hosts** | Tier 2 platforms: NetBSD, DragonFly, macOS (`hvf`); display bridge (virtio-vsock + waypipe) for GUI and Flatpak apps | Boot test passes on every Tier 2 host; a Flatpak GUI app shows a window on the host |
-| **M8 — arm64** | arm64 `GuestRegs`, `arch/um` arm64 port investigation | Feasibility report |
+| **M0 Foundation** ✅ | Workspace, `liu-abi`, `liu-elf`, `liu-platform`, style checker, CI | `cargo xtask ci` passes on Renux, Linux and FreeBSD |
+| **M1 Runtime + test kernel** | `liu-runtime` loads a freestanding test kernel and serves log, memory, time and cpu | ABI conformance suite passes on Renux and Linux |
+| **M2 Guest spaces** | `renux-setscret`, `freebsd-rewrite`, `linux-sysemu`; stub; physmem mappings | A static test binary runs in a guest space on every Tier 1 host |
+| **M3 Linux boots** | `kernel/` patch series, freestanding `arch/um` build, `os-liu` | `init=/bin/sh` from a busybox initramfs; `uname -a` works |
+| **M4 Devices** | `liu-vhost`, console, blk, rng | Root filesystem on `/dev/vda`; console on `hvc0` |
+| **M5 Usable system** | net, fs, supervisor CLI, sandboxing everywhere | Arch, Fedora or Alpine boots; the package manager installs over the network |
+| **M6 Performance** | `trapvec` and `kvm` backends; SMP study | Measurably faster syscalls than ptrace; published benchmarks |
+| **M7 More hosts** | NetBSD, DragonFly, macOS (`hvf`); display bridge (virtio-vsock + waypipe) | Boot test on every Tier 2 host; a Flatpak GUI app opens a window |
+| **M8 arm64** | arm64 `GuestRegs`, `arch/um` arm64 study | Feasibility report |
 
 ## 17. Licensing
 
-- All code authored by LIU is **MPL-2.0**, matching Renux. Every Rust file
-  carries `// SPDX-License-Identifier: MPL-2.0`.
-- The Linux kernel and every file under `kernel/` (patches and `os-liu`) are
-  **GPL-2.0-only**, because they are derived from or compiled into Linux.
-- The generated header `include/liu/host.h` is dual-licensed
-  `MPL-2.0 OR GPL-2.0-only` so it can be included on both sides.
-- LIU code is not marked "Incompatible With Secondary Licenses". MPL-2.0 §3.3
-  therefore permits distributing the runtime combined with the GPL-2.0 kernel
-  image; the LIU source files remain available under MPL-2.0.
-- Device backends are separate programs that communicate over vhost-user and
-  remain purely MPL-2.0.
+- Code written for LIU is **MPL-2.0**, like Renux. Every Rust file carries
+  `// SPDX-License-Identifier: MPL-2.0`.
+- The Linux kernel and everything under `kernel/` that derives from it is
+  **GPL-2.0-only**.
+- The generated `host.h` is `MPL-2.0 OR GPL-2.0-only`, so both sides can include
+  it.
+- LIU code is not marked "Incompatible With Secondary Licenses", so MPL-2.0 §3.3
+  allows distributing the runtime together with the GPL-2.0 kernel image; the
+  LIU source files stay available under MPL-2.0.
+- Device backends are separate programs speaking vhost-user and stay MPL-2.0.
 
-This section describes intent, not legal advice; it should be reviewed before
-the first binary release.
+This describes intent, not legal advice, and should be reviewed before the first
+binary release.
 
 ## 18. Risks and open questions
 
 | Risk | Mitigation |
 |---|---|
-| Freestanding `arch/um` build needs more kernel patching than expected | M1/M2 do not depend on Linux; measure the patch size in M3 and fall back to a static link of the runtime into the kernel if needed |
-| ptrace trap cost makes syscall-heavy workloads slow | Batching in the stub; `trapvec` in M6; keep the backend trait stable |
-| Signal-based interrupt delivery interacting with Rust code on the vCPU thread | Signal handlers only set state and enter Linux; no allocation, no locks; tested by the ABI conformance kernel |
-| Upstream `arch/um` changes between LTS releases | Pin one LTS; CI rebases the series on point releases |
-| `virtio_uml` expects Linux `eventfd` semantics for kicks | `eventfd` where available, a pipe pair elsewhere, behind `liu-platform` |
-| A host's trap mechanism behaves differently from the others | Each backend has its own conformance tests; the trap test suite runs on every Tier 1 host in CI |
-| Portability work slows down the Renux path | Renux is the reference platform; Tier 2 hosts never block a Tier 1 change |
-| glibc vs musl in guest userland | Irrelevant to LIU: the guest runs a real Linux kernel; any distribution works |
+| The freestanding `arch/um` build needs more patching than expected | M1 and M2 do not depend on Linux; measure in M3; fall back to linking the runtime into the kernel |
+| ptrace trap cost slows syscall-heavy workloads | Stub batching; `trapvec` and `kvm` in M6; stable backend trait |
+| Signal-based interrupts interacting with Rust on the vCPU thread | Handlers only set state and enter Linux; no allocation, no locks; covered by the conformance kernel |
+| Upstream `arch/um` changes between LTS releases | Pin one LTS; rebase on point releases |
+| `virtio_uml` expects Linux `eventfd` semantics | `eventfd` where available, a pipe pair elsewhere, inside `liu-platform` |
+| Trap mechanisms differ between hosts | One conformance suite per backend; CI on every Tier 1 host |
+| Ptrace-stopped processes ignore `SIGKILL` on FreeBSD | Found in M0; `liu-platform` kills traced children with `PT_KILL` |
+| Portability work slows the Renux path | Renux is the reference platform; Tier 2 never blocks Tier 1 |
 
 Open questions:
 
-1. 32-bit (i386) guest support: out of scope until M5.
-2. SMP: one vCPU thread per Linux CPU requires `arch/um` SMP support in the
-   pinned kernel; evaluate after M5.
-3. Graphics: the M7 display bridge (virtio-vsock + waypipe) gives software-rendered windows; `virtio-gpu` acceleration is open.
+1. 32-bit (i386) guests: out of scope until M5.
+2. SMP: needs `arch/um` SMP in the pinned kernel; evaluate after M5.
+3. Graphics: the M7 display bridge gives software-rendered windows; GPU
+   acceleration is open.
+
+## 19. LIU and Renux
+
+LIU is a Renux project that also serves other systems. The proposed
+relationship ([ADR 0007](adr/0007-liu-as-a-renux-component.md)):
+
+```mermaid
+flowchart TB
+    subgraph base["Renux base system — built by Zig alone, MPL-2.0 and BSD"]
+        prim["generic kernel primitives<br/>PT_SET_SC_RET · later trapvec"]
+    end
+    subgraph pkgs["Official Renux packages"]
+        pliu["liu<br/>runtime, devices, CLI, rc.d service"]
+        pker["liu-kernel<br/>prebuilt Linux image, GPL-2.0"]
+    end
+    subgraph up["LIU upstream — this repository"]
+        src["Rust workspace · kernel patches · docs"]
+    end
+    others["FreeBSD ports · Linux and NetBSD packages · Homebrew"]
+
+    src --> pliu
+    src --> pker
+    pliu -. "uses when present" .-> prim
+    src --> others
+```
+
+- **The base system keeps only generic primitives.** Renux's base is built by
+  Zig alone and carries no Linux code; LIU needs a Rust toolchain and ships a
+  GPL kernel image, so it does not belong in the base tree.
+- **LIU ships as official Renux packages**: `liu` (runtime, device backends,
+  CLI, `rc.d` service) and `liu-kernel` (the prebuilt Linux image).
+- **LIU stays one upstream** for every host, so Renux benefits from the testing
+  other systems provide, and Renux remains the reference platform.

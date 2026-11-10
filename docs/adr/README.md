@@ -11,6 +11,7 @@ are immutable once accepted; a later record may supersede an earlier one.
 | [0004](0004-pluggable-trap-backends.md) | Pluggable trap backends | Accepted |
 | [0005](0005-no-linux-code-in-renux.md) | No Linux code in the Renux kernel | Accepted |
 | [0006](0006-portable-platform-layer.md) | Portable platform layer | Accepted |
+| [0007](0007-liu-as-a-renux-component.md) | LIU as a Renux component, delivered as a package | Proposed |
 
 New records use the next number and the template below.
 
