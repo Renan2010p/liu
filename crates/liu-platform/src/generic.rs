@@ -149,3 +149,10 @@ random_chunk(buf: &mut [u8]) -> io::Result<usize>
 
     return (Ok(len));
 }
+
+/// No trap backend exists for these hosts yet.
+pub(crate) fn
+open_trap_backend(_caps: &crate::Capabilities) -> io::Result<Box<dyn crate::trap::TrapBackend>>
+{
+    return (Err(io::Error::from(io::ErrorKind::Unsupported)));
+}

@@ -125,6 +125,7 @@ name = "liu-platform"
 version = "0.0.0"
 dependencies = [
  "libc",
+ "liu-abi",
 ]
 
 [[package]]

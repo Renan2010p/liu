@@ -4,6 +4,7 @@
 
 pub mod ptrace;
 pub mod renux;
+pub mod setscret;
 
 use std::io;
 use std::os::fd::{FromRawFd, OwnedFd};
@@ -139,4 +140,17 @@ random_chunk(buf: &mut [u8]) -> io::Result<usize>
     }
 
     return (Ok(ret as usize));
+}
+
+/// Renux uses `renux-setscret`. The stock FreeBSD backend
+/// (`freebsd-rewrite`) is not implemented yet.
+pub(crate) fn
+open_trap_backend(caps: &crate::Capabilities) -> io::Result<Box<dyn crate::trap::TrapBackend>>
+{
+    if caps.renux.set_sc_ret
+    {
+        return (Ok(Box::new(setscret::RenuxSetScRet::new())));
+    }
+
+    return (Err(io::Error::new(io::ErrorKind::Unsupported, "freebsd-rewrite is not implemented yet")));
 }

@@ -385,21 +385,30 @@ flowchart TB
 
 Implemented in M0: `probe`, `SharedMemory`, `fork` with process descriptors,
 the Capsicum sandbox, FreeBSD ptrace wrappers and the Renux `PT_SET_SC_RET`
-primitive. The trap backends and the event loop arrive in M1 and M2, with this
-shape:
+primitive. M2 adds the trap backends, behind trait objects so the runtime
+never names a host (`crates/liu-platform/src/trap.rs`):
 
 ```rust
 pub trait TrapBackend
 {
-    type Space;
+    fn
+    kind(&self) -> TrapBackendKind;
 
     fn
-    create_space(&mut self, physmem: &SharedMemory) -> io::Result<Self::Space>;
+    create_space(&mut self) -> io::Result<Box<dyn GuestSpace>>;
+}
 
+pub trait GuestSpace
+{
+    /// Resume with `regs` (after a syscall trap, `rax` is the Linux result)
+    /// and return the next trap with `regs` updated.
     fn
-    run(&mut self, space: &mut Self::Space, regs: &mut GuestRegs) -> io::Result<TrapEvent>;
+    run(&mut self, regs: &mut GuestRegs) -> io::Result<TrapEvent>;
 }
 ```
+
+`liu_platform::open_trap_backend(&caps)` returns the fastest implemented
+backend for the host.
 
 ### 7.2 Choosing a trap backend
 
@@ -438,13 +447,21 @@ Every modern Unix meets 2 and 3. Requirement 1 decides the trap backend.
 
 | Backend | Hosts | Mechanism | Stops per syscall | Status |
 |---|---|---|:---:|---|
-| `renux-setscret` | Renux | `PT_TO_SCE`, then `PT_SET_SC_RET` skips the call and sets the result | 1 | Primitive verified from Rust |
+| `renux-setscret` | Renux | `PT_TO_SCE`; `PT_SETREGS` with the Linux result, then `PT_SET_SC_RET` with `EJUSTRETURN` skips the call and leaves every register as set | 1 | ✅ M2, 6.6 µs per call |
 | `freebsd-rewrite` | FreeBSD, DragonFly | `PT_TO_SCE`, rewrite the call to a harmless one, `PT_TO_SCX`, set the result with `PT_SETREGS` | 2 | M2 |
 | `linux-sysemu` | Linux | `PTRACE_SYSEMU`, as upstream UML | 1 | M2 |
 | `netbsd-syscallemu` | NetBSD | `PT_SYSCALL` + `PT_SYSCALLEMU` | 1 | M7 |
 | `hvf` | macOS (Intel) | Hypervisor.framework runs only guest user code in ring 3; `syscall` exits to the runtime | 0 | M7 |
 | `kvm` | Linux | the same through `/dev/kvm`, as gVisor's KVM platform | 0 | M6 |
 | `trapvec` | Renux | generic Renux syscall redirection to a supervisor through shared memory | 0 | M6 |
+
+On FreeBSD-family hosts the tracer never sees the page-fault error code
+(`PT_GETREGS` zeroes `r_err`), so `renux-setscret` derives the access type:
+a fault inside the instruction at `rip` is a fetch, `SEGV_ACCERR` is a write,
+`SEGV_MAPERR` is a read. A write to an absent page therefore takes two faults
+(read, then write after Linux maps it read-only). A Renux kernel that fills
+`r_trapno`/`r_err` would make it exact, and the backend already uses them
+when present.
 
 `trapvec` must stay Linux-agnostic: it delivers raw register state and never
 interprets syscall numbers, so it is useful to any user-space emulator or
@@ -695,7 +712,7 @@ are generic (D5).
 | Platform | shared memory, processes, Capsicum, `PT_SET_SC_RET` on the running kernel | `crates/liu-platform/tests` ✅ |
 | ABI drift | regenerate `host.h` and fail on diff; compile a C probe and compare every offset | `cargo xtask check-header`, `check-abi` ✅ |
 | ABI conformance | a freestanding Rust test kernel that calls every `host_ops` entry | `cargo xtask test-abi` ✅ |
-| Trap backends | static programs in a guest space: syscalls, faults, signals | `tests/trap/` (M2) |
+| Trap backends | hand-assembled Linux code in a guest space: syscalls, errors, faults, TLS | `crates/liu-platform/tests/trap_renux.rs` ✅ (Renux only) |
 | Boot | boot `liu_defconfig` to a busybox initramfs and script a shell session | `cargo xtask test-boot` (M3) |
 | Compatibility | selected Linux Test Project suites inside the guest | nightly (M5) |
 

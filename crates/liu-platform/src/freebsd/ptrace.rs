@@ -16,6 +16,18 @@ use crate::sys;
 /// entering and skip its execution. Valid only at a `PT_TO_SCE` stop.
 pub const PT_SET_SC_RET: libc::c_int = 45;
 
+/// `PT_FIRSTMACH + 7..10` (`machine/ptrace.h`): the tracee's FS and GS base.
+const PT_GETFSBASE: libc::c_int = 71;
+const PT_SETFSBASE: libc::c_int = 72;
+const PT_GETGSBASE: libc::c_int = 73;
+const PT_SETGSBASE: libc::c_int = 74;
+
+/// Kernel-internal errno meaning "leave the registers alone". Passed as the
+/// error of [`set_sc_ret`], the skipped call returns with exactly the
+/// registers the tracer set, which is how a Linux result (`rax`, nothing
+/// else) is delivered without FreeBSD's carry flag and `rdx` conventions.
+pub const EJUSTRETURN: i32 = -2;
+
 /// `ptrace(2)` address meaning "resume where the tracee stopped". It is a
 /// sentinel, never dereferenced.
 fn
@@ -123,6 +135,51 @@ set_regs(pid: libc::pid_t, regs: &libc::reg) -> io::Result<()>
     let addr: *mut libc::c_char = (regs as *const libc::reg).cast_mut().cast::<libc::c_char>();
 
     return (request(libc::PT_SETREGS, pid, addr, 0));
+}
+
+fn
+get_base(req: libc::c_int, pid: libc::pid_t) -> io::Result<u64>
+{
+    let mut base: libc::register_t = 0;
+
+    request(req, pid, (&mut base as *mut libc::register_t).cast::<libc::c_char>(), 0)?;
+    return (Ok(base as u64));
+}
+
+fn
+set_base(req: libc::c_int, pid: libc::pid_t, base: u64) -> io::Result<()>
+{
+    let mut value: libc::register_t = base as libc::register_t;
+
+    return (request(req, pid, (&mut value as *mut libc::register_t).cast::<libc::c_char>(), 0));
+}
+
+/// Reads the tracee's FS base (TLS pointer on x86_64).
+pub fn
+get_fs_base(pid: libc::pid_t) -> io::Result<u64>
+{
+    return (get_base(PT_GETFSBASE, pid));
+}
+
+/// Sets the tracee's FS base.
+pub fn
+set_fs_base(pid: libc::pid_t, base: u64) -> io::Result<()>
+{
+    return (set_base(PT_SETFSBASE, pid, base));
+}
+
+/// Reads the tracee's GS base.
+pub fn
+get_gs_base(pid: libc::pid_t) -> io::Result<u64>
+{
+    return (get_base(PT_GETGSBASE, pid));
+}
+
+/// Sets the tracee's GS base.
+pub fn
+set_gs_base(pid: libc::pid_t, base: u64) -> io::Result<()>
+{
+    return (set_base(PT_SETGSBASE, pid, base));
 }
 
 /// Renux: completes the system call the tracee is entering with `result`

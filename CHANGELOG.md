@@ -35,5 +35,11 @@ All notable changes to LIU are documented here.
 - `liu-runtime`: kernel memory (`kmap`, `kunmap`, `kprotect`,
   `kstack_alloc`, `kstack_free`) confined to a 1 GiB window after physmem.
   This completes M1.
+- `liu-platform`: `TrapBackend` and `GuestSpace` traits and
+  `open_trap_backend`; the `renux-setscret` backend (M2): one ptrace stop
+  per guest system call, results delivered with `PT_SETREGS` +
+  `PT_SET_SC_RET(EJUSTRETURN)` so the guest sees exact Linux semantics;
+  faults with derived access type; FS/GS base. Tests run hand-assembled
+  Linux code on Renux (6.6 µs per system call).
 - `tests/abi-kernel`: freestanding `no_std` test kernel linked at
   `0x60000000` like arch/um, run by `cargo xtask test-abi` in CI.

@@ -137,3 +137,10 @@ random_chunk(buf: &mut [u8]) -> io::Result<usize>
 
     return (Ok(ret as usize));
 }
+
+/// `linux-sysemu` is not implemented yet.
+pub(crate) fn
+open_trap_backend(_caps: &crate::Capabilities) -> io::Result<Box<dyn crate::trap::TrapBackend>>
+{
+    return (Err(io::Error::new(io::ErrorKind::Unsupported, "linux-sysemu is not implemented yet")));
+}
