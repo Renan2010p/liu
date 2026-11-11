@@ -18,8 +18,8 @@ use core::fmt::{self, Write};
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 
-use liu_abi::status::{STATUS_INVALID, STATUS_OK, STATUS_UNSUPPORTED};
-use liu_abi::{provides, BootInfo, HostOps, KernelOps, Status, PAGE_SIZE};
+use liu_abi::status::{STATUS_DENIED, STATUS_FAULT, STATUS_INVALID, STATUS_OK, STATUS_UNSUPPORTED};
+use liu_abi::{provides, BootInfo, HostOps, KernelOps, Status, PAGE_SIZE, PROT_EXEC, PROT_READ, PROT_WRITE};
 
 /// The host table, kept for the panic and timer handlers.
 static HOST: AtomicPtr<HostOps> = AtomicPtr::new(core::ptr::null_mut());
@@ -65,7 +65,7 @@ impl Write for Console<'_>
 struct Missing(&'static str);
 
 /// One conformance check: `Ok(true)` passed, `Ok(false)` failed.
-type Check = fn(&mut Console, &HostOps) -> Result<bool, Missing>;
+type Check = fn(&mut Console, &HostOps, &BootInfo) -> Result<bool, Missing>;
 
 /// Returns a host entry or the name of the missing one.
 fn
@@ -144,7 +144,7 @@ check_boot(con: &mut Console, boot: &BootInfo) -> bool
 
 /// `clock_monotonic` and `clock_realtime`.
 fn
-check_clocks(con: &mut Console, host: &HostOps) -> Result<bool, Missing>
+check_clocks(con: &mut Console, host: &HostOps, _boot: &BootInfo) -> Result<bool, Missing>
 {
     let monotonic: unsafe extern "C" fn() -> u64 = need(host.clock_monotonic, "clock_monotonic")?;
     let realtime: unsafe extern "C" fn() -> u64 = need(host.clock_realtime, "clock_realtime")?;
@@ -163,7 +163,7 @@ check_clocks(con: &mut Console, host: &HostOps) -> Result<bool, Missing>
 
 /// `get_random`.
 fn
-check_random(con: &mut Console, host: &HostOps) -> Result<bool, Missing>
+check_random(con: &mut Console, host: &HostOps, _boot: &BootInfo) -> Result<bool, Missing>
 {
     let random: unsafe extern "C" fn(*mut u8, usize) -> Status = need(host.get_random, "get_random")?;
     let mut a: [u8; 64] = [0; 64];
@@ -187,7 +187,7 @@ check_random(con: &mut Console, host: &HostOps) -> Result<bool, Missing>
 
 /// Interrupt flags, the one-shot timer, `idle` and delivery at safe points.
 fn
-check_timer(con: &mut Console, host: &HostOps) -> Result<bool, Missing>
+check_timer(con: &mut Console, host: &HostOps, _boot: &BootInfo) -> Result<bool, Missing>
 {
     let now: unsafe extern "C" fn() -> u64 = need(host.clock_monotonic, "clock_monotonic")?;
     let enable: unsafe extern "C" fn() -> () = need(host.irq_enable, "irq_enable")?;
@@ -278,6 +278,170 @@ check_timer(con: &mut Console, host: &HostOps) -> Result<bool, Missing>
     return (Ok(true));
 }
 
+/// Physical page used by the kmap test.
+const TEST_PHYS: u64 = 1 << 20;
+
+/// Pattern written through the linear map and read through the window.
+const PATTERN: &[u8; 12] = b"liu-physmem!";
+
+/// `kmap`, `kunmap` and `kprotect`: the window aliases physical memory, and
+/// bad requests are refused with the documented status.
+fn
+check_kmem(con: &mut Console, host: &HostOps, boot: &BootInfo) -> Result<bool, Missing>
+{
+    let kmap: unsafe extern "C" fn(u64, u64, u64, u32) -> Status = need(host.kmap, "kmap")?;
+    let kunmap: unsafe extern "C" fn(u64, u64) -> Status = need(host.kunmap, "kunmap")?;
+    let kprotect: unsafe extern "C" fn(u64, u64, u32) -> Status = need(host.kprotect, "kprotect")?;
+    let (rw, r): (u32, u32) = (PROT_READ | PROT_WRITE, PROT_READ);
+
+    if boot.kmap_size < 4 * PAGE_SIZE || boot.physmem_size < TEST_PHYS + PAGE_SIZE
+    {
+        let _: fmt::Result = writeln!(con, "abi-kernel: FAIL kmap window {:#x}", boot.kmap_size);
+        return (Ok(false));
+    }
+
+    let va: u64 = boot.kmap_base;
+    let linear: *mut u8 = (boot.physmem_base + TEST_PHYS) as usize as *mut u8;
+
+    // SAFETY: `linear` is inside the linear map of physical memory, and `va`
+    // is only accessed after a successful kmap made it readable (and
+    // writable where it is written).
+    unsafe
+    {
+        for (i, byte) in PATTERN.iter().enumerate()
+        {
+            linear.add(i).write_volatile(*byte);
+        }
+
+        let mapped: (Status, Status) = (kmap(va, TEST_PHYS, PAGE_SIZE, rw), kmap(va + PAGE_SIZE, TEST_PHYS, PAGE_SIZE, r));
+
+        if mapped != (STATUS_OK, STATUS_OK)
+        {
+            let _: fmt::Result = writeln!(con, "abi-kernel: FAIL kmap {:?}", mapped);
+            return (Ok(false));
+        }
+
+        let window: *mut u8 = va as usize as *mut u8;
+        let alias: *const u8 = (va + PAGE_SIZE) as usize as *const u8;
+        let same: bool = (0..PATTERN.len()).all(|i: usize| -> bool
+        {
+            return (window.add(i).read_volatile() == PATTERN[i]);
+        });
+
+        window.write_volatile(b'L');
+        if !same || linear.read_volatile() != b'L' || alias.read_volatile() != b'L'
+        {
+            let _: fmt::Result = writeln!(con, "abi-kernel: FAIL window does not alias physical memory");
+            return (Ok(false));
+        }
+    }
+    let _: fmt::Result = writeln!(con, "abi-kernel: kmap {:#x} aliases phys {:#x}", va, TEST_PHYS);
+
+    // SAFETY: host entries taking plain integers; none of these calls
+    // touches memory the kernel is using.
+    let results: [(Status, Status); 8] = unsafe
+    {
+        [
+            (kprotect(va, PAGE_SIZE, r), STATUS_OK),
+            (kmap(va - PAGE_SIZE, TEST_PHYS, PAGE_SIZE, r), STATUS_FAULT),
+            (kmap(va + boot.kmap_size, TEST_PHYS, PAGE_SIZE, r), STATUS_FAULT),
+            (kmap(va, boot.physmem_size, PAGE_SIZE, r), STATUS_FAULT),
+            (kmap(va, TEST_PHYS, PAGE_SIZE, PROT_WRITE | PROT_EXEC), STATUS_DENIED),
+            (kmap(va + 1, TEST_PHYS, PAGE_SIZE, r), STATUS_INVALID),
+            (kunmap(va, 2 * PAGE_SIZE), STATUS_OK),
+            (kprotect(va, PAGE_SIZE, r), STATUS_FAULT),
+        ]
+    };
+
+    for (index, (got, want)) in results.iter().enumerate()
+    {
+        if got != want
+        {
+            let _: fmt::Result = writeln!(con, "abi-kernel: FAIL kmem case {}: status {} instead of {}", index, got, want);
+            return (Ok(false));
+        }
+    }
+    let _: fmt::Result = writeln!(con, "abi-kernel: kmem ok (protect, unmap, refusals)");
+    return (Ok(true));
+}
+
+/// Returns an address in its own stack frame.
+extern "C" fn
+stack_probe() -> u64
+{
+    let marker: u64 = 0;
+
+    return (core::hint::black_box(&marker) as *const u64 as u64);
+}
+
+/// Calls `func` with the stack pointer set to `top`, then switches back.
+///
+/// # Safety
+///
+/// `top` must be the 16-byte aligned top of a writable stack large enough
+/// for `func`.
+unsafe fn
+call_on_stack(top: u64, func: extern "C" fn() -> u64) -> u64
+{
+    let result: u64;
+
+    // SAFETY: guaranteed by the caller. r12 is callee-saved, so it keeps the
+    // old stack pointer across the call; the target has no red zone.
+    unsafe
+    {
+        core::arch::asm!(
+            "mov r12, rsp",
+            "mov rsp, {top}",
+            "call {func}",
+            "mov rsp, r12",
+            top = in(reg) top,
+            func = in(reg) func,
+            out("r12") _,
+            lateout("rax") result,
+            clobber_abi("C"),
+        );
+    }
+
+    return (result);
+}
+
+/// `kstack_alloc` and `kstack_free`: code runs on an allocated stack.
+fn
+check_kstack(con: &mut Console, host: &HostOps, _boot: &BootInfo) -> Result<bool, Missing>
+{
+    let alloc: unsafe extern "C" fn(u64, *mut u64) -> Status = need(host.kstack_alloc, "kstack_alloc")?;
+    let free: unsafe extern "C" fn(u64, u64) -> () = need(host.kstack_free, "kstack_free")?;
+    let size: u64 = 4 * PAGE_SIZE;
+    let mut base: u64 = 0;
+    let mut unused: u64 = 0;
+
+    // SAFETY: `base` and `unused` are writable u64s.
+    let status: (Status, Status) = unsafe { (alloc(size, &mut base), alloc(0, &mut unused)) };
+
+    if status != (STATUS_OK, STATUS_INVALID) || base == 0 || base % PAGE_SIZE != 0
+    {
+        let _: fmt::Result = writeln!(con, "abi-kernel: FAIL kstack_alloc {:?} at {:#x}", status, base);
+        return (Ok(false));
+    }
+
+    // SAFETY: `base + size` is the page-aligned top of a fresh stack of
+    // `size` bytes, plenty for `stack_probe`.
+    let sp: u64 = unsafe { call_on_stack(base + size, stack_probe) };
+
+    // SAFETY: frees the stack just allocated, which nothing uses any more.
+    unsafe
+    {
+        free(base, size);
+    }
+    if sp < base || sp >= base + size
+    {
+        let _: fmt::Result = writeln!(con, "abi-kernel: FAIL code ran at {:#x}, not on the stack {:#x}", sp, base);
+        return (Ok(false));
+    }
+    let _: fmt::Result = writeln!(con, "abi-kernel: kstack ok (ran at {:#x} on a {} KiB stack)", sp, size >> 10);
+    return (Ok(true));
+}
+
 /// Runs every check and returns the status the entry point reports.
 fn
 run(host: &HostOps, boot: &BootInfo) -> Status
@@ -290,11 +454,11 @@ run(host: &HostOps, boot: &BootInfo) -> Status
         return (STATUS_INVALID);
     }
 
-    let checks: [Check; 3] = [check_clocks, check_random, check_timer];
+    let checks: [Check; 5] = [check_clocks, check_random, check_timer, check_kmem, check_kstack];
 
     for check in checks
     {
-        match check(&mut con, host)
+        match check(&mut con, host, boot)
         {
             Ok(true) =>
             {

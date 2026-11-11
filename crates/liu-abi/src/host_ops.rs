@@ -34,8 +34,16 @@ pub struct HostOps
     // Kernel address space.
     /// Maps `len` bytes of physical memory at `phys` to kernel address
     /// `vaddr`, replacing any previous mapping.
+    ///
+    /// The range must lie in the `kmap` window of `BootInfo`, and every
+    /// argument must be page aligned (`STATUS_INVALID`). A range outside the
+    /// window or beyond physical memory is `STATUS_FAULT`; writable and
+    /// executable at once is `STATUS_DENIED`.
     pub kmap: Option<unsafe extern "C" fn(vaddr: u64, phys: u64, len: u64, prot: u32) -> Status>,
+    /// Makes a window range inaccessible again. Unmapped pages are ignored.
     pub kunmap: Option<unsafe extern "C" fn(vaddr: u64, len: u64) -> Status>,
+    /// Changes the protection of mapped window pages; any unmapped page in
+    /// the range is `STATUS_FAULT`. Same rules as `kmap` otherwise.
     pub kprotect: Option<unsafe extern "C" fn(vaddr: u64, len: u64, prot: u32) -> Status>,
 
     // Guest address spaces. Changes may be queued until `as_flush` or the
@@ -78,7 +86,12 @@ pub struct HostOps
     pub timer_cancel: Option<unsafe extern "C" fn() -> ()>,
 
     // Kernel thread stacks.
+    /// Allocates a zero-filled stack of `size` bytes (a page multiple) with
+    /// an inaccessible guard page below it, and stores its lowest usable
+    /// address in `out`. The stack grows down from `*out + size`.
     pub kstack_alloc: Option<unsafe extern "C" fn(size: u64, out: *mut u64) -> Status>,
+    /// Frees a stack returned by `kstack_alloc`, given the same address and
+    /// size. Anything else is ignored.
     pub kstack_free: Option<unsafe extern "C" fn(addr: u64, size: u64) -> ()>,
 
     // Entropy.

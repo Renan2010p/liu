@@ -94,8 +94,8 @@ LIU is in its first milestones. **It does not run Linux programs yet.**
 | | Milestone | |
 |:---:|---|---|
 | ✅ | **M0** Foundation | ABI, ELF loader, platform layer, CI on Linux and FreeBSD |
-| 🔨 | **M1** Runtime | load a freestanding test kernel, serve the ABI |
-| | **M2** Guest processes | trap backends on every Tier 1 host |
+| ✅ | **M1** Runtime | load a freestanding test kernel, serve the ABI |
+| 🔨 | **M2** Guest processes | trap backends on every Tier 1 host |
 | | **M3** Linux boots | `init=/bin/sh` from an initramfs |
 | | **M4** Devices | root filesystem and console over virtio |
 | | **M5** Usable system | Arch, Fedora or Alpine with networking |
@@ -129,6 +129,9 @@ abi-kernel: clocks ok (realtime 1794408338 s)
 abi-kernel: random ok
 abi-kernel: idle woke after 10022 us
 abi-kernel: timer ok (safe points, cancel, handlers disabled)
+abi-kernel: kmap 0x62200000 aliases phys 0x100000
+abi-kernel: kmem ok (protect, unmap, refusals)
+abi-kernel: kstack ok (ran at 0x31bd1987efe8 on a 16 KiB stack)
 abi-kernel: pass
 test-abi: passed
 ```
@@ -145,6 +148,7 @@ crates/
   liu-abi/        host ABI: tables, registers, traps, status codes   no_std
   liu-elf/        ELF64 parser and kernel image load planner         no_std
   liu-platform/   probing, shared memory, processes, ptrace, sandbox
+  liu-physmem/    guest physical memory, bounds-checked
   liu-runtime/    the kernel process (liu-kernel): loader, host_ops
 tests/abi-kernel/ freestanding test kernel for the ABI suite         no_std
 kernel/           Linux side; generated include/liu/host.h           GPL-2.0

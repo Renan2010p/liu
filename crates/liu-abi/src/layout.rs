@@ -69,6 +69,8 @@ pub const TYPES: &[TypeLayout] = &[
             initrd_size,
             fpu_state_size,
             page_size,
+            kmap_base,
+            kmap_size,
         ]
     ),
     layout!(

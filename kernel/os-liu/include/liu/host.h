@@ -20,7 +20,7 @@
  * Additive changes (new table entries appended at the end) increment the
  * minor version.
  */
-#define LIU_ABI_VERSION_MINOR 1
+#define LIU_ABI_VERSION_MINOR 2
 
 /**
  * `b"LIU\0"` read as a little-endian `u32`.
@@ -221,9 +221,21 @@ typedef struct liu_host_ops {
   /**
    * Maps `len` bytes of physical memory at `phys` to kernel address
    * `vaddr`, replacing any previous mapping.
+   *
+   * The range must lie in the `kmap` window of `BootInfo`, and every
+   * argument must be page aligned (`STATUS_INVALID`). A range outside the
+   * window or beyond physical memory is `STATUS_FAULT`; writable and
+   * executable at once is `STATUS_DENIED`.
    */
   liu_status (*kmap)(uint64_t vaddr, uint64_t phys, uint64_t len, uint32_t prot);
+  /**
+   * Makes a window range inaccessible again. Unmapped pages are ignored.
+   */
   liu_status (*kunmap)(uint64_t vaddr, uint64_t len);
+  /**
+   * Changes the protection of mapped window pages; any unmapped page in
+   * the range is `STATUS_FAULT`. Same rules as `kmap` otherwise.
+   */
   liu_status (*kprotect)(uint64_t vaddr, uint64_t len, uint32_t prot);
   liu_status (*as_create)(liu_handle *out);
   liu_status (*as_destroy)(liu_handle space);
@@ -257,7 +269,16 @@ typedef struct liu_host_ops {
    */
   liu_status (*timer_set)(uint64_t deadline);
   void (*timer_cancel)(void);
+  /**
+   * Allocates a zero-filled stack of `size` bytes (a page multiple) with
+   * an inaccessible guard page below it, and stores its lowest usable
+   * address in `out`. The stack grows down from `*out + size`.
+   */
   liu_status (*kstack_alloc)(uint64_t size, uint64_t *out);
+  /**
+   * Frees a stack returned by `kstack_alloc`, given the same address and
+   * size. Anything else is ignored.
+   */
   void (*kstack_free)(uint64_t addr, uint64_t size);
   liu_status (*get_random)(uint8_t *buf, size_t len);
   liu_status (*dev_connect)(const uint8_t *name, size_t len, liu_handle *out);
@@ -355,6 +376,15 @@ typedef struct liu_boot_info {
    * Host page size. Version 0 requires `PAGE_SIZE`.
    */
   uint64_t page_size;
+  /**
+   * Start of the window where `kmap` may map physical memory (ABI 0.2).
+   * The window is page aligned and inaccessible until mapped.
+   */
+  uint64_t kmap_base;
+  /**
+   * Size of the `kmap` window in bytes (ABI 0.2).
+   */
+  uint64_t kmap_size;
 } liu_boot_info;
 
 /**

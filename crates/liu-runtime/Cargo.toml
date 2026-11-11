@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 liu-abi.workspace = true
 liu-elf.workspace = true
+liu-physmem.workspace = true
 liu-platform.workspace = true
 
 [lints]

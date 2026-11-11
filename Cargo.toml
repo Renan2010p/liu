@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/liu-abi",
     "crates/liu-elf",
+    "crates/liu-physmem",
     "crates/liu-platform",
     "crates/liu-runtime",
     "xtask",
@@ -20,6 +21,7 @@ publish = false
 [workspace.dependencies]
 liu-abi = { path = "crates/liu-abi" }
 liu-elf = { path = "crates/liu-elf" }
+liu-physmem = { path = "crates/liu-physmem" }
 liu-platform = { path = "crates/liu-platform" }
 libc = "0.2.180"
 

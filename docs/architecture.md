@@ -180,6 +180,11 @@ flowchart LR
     phys --- dev
 ```
 
+In the kernel process the layout is fixed: the image at its link address
+(`0x60000000`, as arch/um), physmem after it, then the `kmap` window, each
+2 MiB aligned. The window is reserved inaccessible at start-up and is the
+only place `kmap` maps, so the kernel can never replace runtime memory.
+
 A page fault in a guest space becomes a trap. Linux resolves it in its own page
 tables, and the runtime applies the resulting mapping in the guest space.
 
@@ -305,7 +310,7 @@ The authoritative definition is `crates/liu-abi/src/host_ops.rs`.
 | Group | Operations | Notes |
 |---|---|---|
 | **console** | `log_write`, `panic` | Early boot output. `panic` does not return. |
-| **kernel memory** | `kmap`, `kunmap`, `kprotect` | Map physmem ranges at kernel-chosen addresses. Physmem itself is mapped at `boot.physmem_base` before entry. |
+| **kernel memory** | `kmap`, `kunmap`, `kprotect` | Map physmem ranges at kernel-chosen addresses inside the window `boot.kmap_base`/`kmap_size` (ABI 0.2), never elsewhere; W+X is refused. Physmem itself is mapped at `boot.physmem_base` before entry. |
 | **address spaces** | `as_create`, `as_destroy`, `as_map`, `as_unmap`, `as_protect`, `as_flush` | Changes are batched until `as_flush` or `as_run`. |
 | **execution** | `as_run`, `as_get_fpu`, `as_set_fpu` | Run guest user code until the next trap. TLS bases are part of `GuestRegs`. |
 | **cpu** | `irq_enable`, `irq_disable`, `irq_save`, `irq_restore`, `idle` | `idle` blocks the vCPU until an interrupt is pending. |
@@ -550,9 +555,9 @@ liu/
 │   ├── liu-elf/          ELF64 parser and kernel load planner          no_std  ✅
 │   ├── liu-platform/     the only host-specific code                           ✅
 │   │   └── src/{freebsd/, linux/, generic.rs}
-│   ├── liu-physmem/      bounds-checked guest physical memory access
+│   ├── liu-physmem/      bounds-checked guest physical memory access          ✅
 │   ├── liu-trap/         guest stub and host-independent trap handling
-│   ├── liu-runtime/      kernel process: loader, host_ops, vCPU, events          🔨
+│   ├── liu-runtime/      kernel process: loader, host_ops, vCPU, events          ✅
 │   ├── liu-vhost/        vhost-user protocol and virtqueues
 │   ├── liu-dev-*/        device backends: console, blk, net, fs, rng
 │   ├── liu-config/       instance configuration
@@ -689,7 +694,7 @@ are generic (D5).
 | Unit | ABI layout and negotiation, ELF validation, style rules | `cargo test` ✅ |
 | Platform | shared memory, processes, Capsicum, `PT_SET_SC_RET` on the running kernel | `crates/liu-platform/tests` ✅ |
 | ABI drift | regenerate `host.h` and fail on diff; compile a C probe and compare every offset | `cargo xtask check-header`, `check-abi` ✅ |
-| ABI conformance | a freestanding Rust test kernel that calls every `host_ops` entry | `cargo xtask test-abi` 🔨 (M1: console, time, random, cpu done) |
+| ABI conformance | a freestanding Rust test kernel that calls every `host_ops` entry | `cargo xtask test-abi` ✅ |
 | Trap backends | static programs in a guest space: syscalls, faults, signals | `tests/trap/` (M2) |
 | Boot | boot `liu_defconfig` to a busybox initramfs and script a shell session | `cargo xtask test-boot` (M3) |
 | Compatibility | selected Linux Test Project suites inside the guest | nightly (M5) |
@@ -701,8 +706,8 @@ which takes hours on the development machine.
 
 ```mermaid
 flowchart LR
-    M0["✅ M0<br/>Foundation"] --> M1["🔨 M1<br/>Runtime +<br/>test kernel"]
-    M1 --> M2["M2<br/>Guest spaces"]
+    M0["✅ M0<br/>Foundation"] --> M1["✅ M1<br/>Runtime +<br/>test kernel"]
+    M1 --> M2["🔨 M2<br/>Guest spaces"]
     M2 --> M3["M3<br/>Linux boots"]
     M3 --> M4["M4<br/>Devices"]
     M4 --> M5["M5<br/>Usable system"]
@@ -712,13 +717,14 @@ flowchart LR
     M7 --> M8
 
     style M0 fill:#c8f0c8,stroke:#2e8b2e,color:#000
-    style M1 fill:#fff1b8,stroke:#b38f00,color:#000
+    style M1 fill:#c8f0c8,stroke:#2e8b2e,color:#000
+    style M2 fill:#fff1b8,stroke:#b38f00,color:#000
 ```
 
 | Milestone | Deliverable | Exit criterion |
 |---|---|---|
 | **M0 Foundation** ✅ | Workspace, `liu-abi`, `liu-elf`, `liu-platform`, style checker, CI | `cargo xtask ci` passes on Renux, Linux and FreeBSD |
-| **M1 Runtime + test kernel** | `liu-runtime` loads a freestanding test kernel and serves log, memory, time and cpu | ABI conformance suite passes on Renux and Linux |
+| **M1 Runtime + test kernel** ✅ | `liu-runtime` loads a freestanding test kernel and serves log, memory, time and cpu | ABI conformance suite passes on Renux and Linux |
 | **M2 Guest spaces** | `renux-setscret`, `freebsd-rewrite`, `linux-sysemu`; stub; physmem mappings | A static test binary runs in a guest space on every Tier 1 host |
 | **M3 Linux boots** | `kernel/` patch series, freestanding `arch/um` build, `os-liu` | `init=/bin/sh` from a busybox initramfs; `uname -a` works |
 | **M4 Devices** | `liu-vhost`, console, blk, rng | Root filesystem on `/dev/vda`; console on `hvc0` |

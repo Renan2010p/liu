@@ -35,6 +35,11 @@ pub struct BootInfo
     pub fpu_state_size: u64,
     /// Host page size. Version 0 requires `PAGE_SIZE`.
     pub page_size: u64,
+    /// Start of the window where `kmap` may map physical memory (ABI 0.2).
+    /// The window is page aligned and inaccessible until mapped.
+    pub kmap_base: u64,
+    /// Size of the `kmap` window in bytes (ABI 0.2).
+    pub kmap_size: u64,
 }
 
-const _: () = assert!(size_of::<BootInfo>() == 16 + 11 * 8);
+const _: () = assert!(size_of::<BootInfo>() == 16 + 13 * 8);

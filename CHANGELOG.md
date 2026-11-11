@@ -26,5 +26,14 @@ All notable changes to LIU are documented here.
 - `liu-runtime`: the time, random and cpu groups of `host_ops` (`clock_*`,
   `get_random`, `timer_set`, `timer_cancel`, `irq_*`, `idle`), with
   interrupts delivered at safe points (ADR 0008).
+- Host ABI 0.2: `BootInfo` gains `kmap_base` and `kmap_size`; `kmap`,
+  `kprotect` and `kstack_*` semantics are documented in `host_ops.rs`.
+- `liu-platform`: `Window` (inaccessible reserved range where shared memory
+  is mapped page by page) and `Stack` (stack with a guard page).
+- `liu-physmem`: guest physical memory with its linear map and checked
+  physical ranges.
+- `liu-runtime`: kernel memory (`kmap`, `kunmap`, `kprotect`,
+  `kstack_alloc`, `kstack_free`) confined to a 1 GiB window after physmem.
+  This completes M1.
 - `tests/abi-kernel`: freestanding `no_std` test kernel linked at
   `0x60000000` like arch/um, run by `cargo xtask test-abi` in CI.

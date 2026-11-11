@@ -44,7 +44,7 @@ pub use caps::{Capabilities, HostOs, RenuxExtensions, SandboxKind, TrapBackendKi
 pub use process::{Child, ForkResult, WaitStatus};
 pub use shm::{Mapping, Protection, SharedMemory};
 pub use time::{clock_monotonic_ns, clock_realtime_ns, fill_random};
-pub use vm::{page_size, Region};
+pub use vm::{page_size, Region, Stack, Window};
 
 /// Inspects the running host and reports what LIU can use on it.
 ///

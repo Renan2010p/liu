@@ -3,14 +3,16 @@
 //! LIU runtime: the kernel process.
 //!
 //! The runtime maps a freestanding kernel image at its link-time address,
-//! creates guest physical memory, and calls `liu_kernel_entry` on a vCPU
-//! thread with the host ABI tables (`docs/architecture.md` §5 and §6).
+//! creates guest physical memory and the `kmap` window after it (see
+//! [`kmem`]), and calls `liu_kernel_entry` on a vCPU thread with the host
+//! ABI tables (`docs/architecture.md` §5 and §6).
 
 #![deny(unsafe_code)]
 
 pub mod config;
 pub mod cpu;
 pub mod image;
+pub mod kmem;
 #[allow(unsafe_code)]
 pub mod ops;
 
@@ -20,7 +22,10 @@ use std::io;
 use std::thread;
 
 use liu_abi::{BootInfo, KernelOps, Status, TableHeader, HANDLE_INVALID, PAGE_SIZE};
-use liu_platform::{Mapping, Protection, SharedMemory};
+use liu_physmem::Physmem;
+use liu_platform::Window;
+
+use kmem::{KernelMemory, KMAP_WINDOW_SIZE};
 
 pub use config::Config;
 pub use image::{KernelImage, LoadError};
@@ -28,7 +33,8 @@ pub use image::{KernelImage, LoadError};
 /// Stack size of the vCPU thread, which the kernel runs on at entry.
 pub const VCPU_STACK_SIZE: usize = 8 << 20;
 
-/// Alignment of guest physical memory in the kernel's address space.
+/// Alignment of guest physical memory and of the `kmap` window in the
+/// kernel's address space.
 pub const PHYSMEM_ALIGN: u64 = 2 << 20;
 
 /// Why the runtime could not run the kernel.
@@ -38,7 +44,8 @@ pub enum RuntimeError
     PageSize(usize),
     Read(io::Error),
     Load(LoadError),
-    Physmem(io::Error),
+    Physmem(u64, io::Error),
+    Window(u64, io::Error),
     Thread(io::Error),
     /// The vCPU thread ended without a status.
     VcpuPanicked,
@@ -54,7 +61,14 @@ impl fmt::Display for RuntimeError
             RuntimeError::PageSize(size) => write!(f, "host page size {} is not supported", size),
             RuntimeError::Read(error) => write!(f, "cannot read the kernel image: {}", error),
             RuntimeError::Load(error) => write!(f, "cannot load the kernel image: {}", error),
-            RuntimeError::Physmem(error) => write!(f, "cannot create guest memory: {}", error),
+            RuntimeError::Physmem(addr, error) =>
+            {
+                write!(f, "cannot create guest memory at {:#x}: {}", addr, error)
+            }
+            RuntimeError::Window(addr, error) =>
+            {
+                write!(f, "cannot reserve the kmap window at {:#x}: {}", addr, error)
+            }
             RuntimeError::Thread(error) => write!(f, "cannot start the vCPU thread: {}", error),
             RuntimeError::VcpuPanicked => f.write_str("the vCPU thread panicked"),
         };
@@ -67,12 +81,13 @@ impl std::error::Error for RuntimeError
 {
 }
 
-/// Returns where guest physical memory goes: the first aligned address
-/// after the image, as arch/um places it after `_end`.
+/// Returns the first aligned address after `end`. Physical memory follows
+/// the image, as arch/um places it after `_end`, and the `kmap` window
+/// follows physical memory.
 pub fn
-physmem_base(image_end: u64) -> u64
+physmem_base(end: u64) -> u64
 {
-    return ((image_end + PHYSMEM_ALIGN - 1) & !(PHYSMEM_ALIGN - 1));
+    return ((end + PHYSMEM_ALIGN - 1) & !(PHYSMEM_ALIGN - 1));
 }
 
 /// Loads the kernel described by `config`, runs it until it returns, and
@@ -92,13 +107,14 @@ run(config: &Config) -> Result<Status, RuntimeError>
 
     drop(data);
 
-    let shm: SharedMemory = SharedMemory::create(config.memory).map_err(RuntimeError::Physmem)?;
     let base: u64 = physmem_base(image.base() + image.size());
-    let physmem: Mapping = shm
-        .map_at(0, config.memory as usize, Protection::READ_WRITE, base)
-        .map_err(RuntimeError::Physmem)?;
+    let physmem: Physmem = Physmem::create_at(config.memory, base)
+        .map_err(|error: io::Error| -> RuntimeError { return (RuntimeError::Physmem(base, error)); })?;
+    let window_base: u64 = physmem_base(physmem.base() + physmem.size());
+    let window: Window = Window::reserve_at(window_base, KMAP_WINDOW_SIZE as usize)
+        .map_err(|error: io::Error| -> RuntimeError { return (RuntimeError::Window(window_base, error)); })?;
+    let kmem: KernelMemory = KernelMemory::new(physmem, window);
     let cmdline: &[u8] = config.cmdline.as_bytes();
-    let physmem_range: (u64, u64) = (physmem.as_ptr() as usize as u64, physmem.len() as u64);
 
     let status: Result<Status, RuntimeError> = thread::scope(
         |scope: &thread::Scope| -> Result<Status, RuntimeError>
@@ -108,7 +124,7 @@ run(config: &Config) -> Result<Status, RuntimeError>
                 .stack_size(VCPU_STACK_SIZE)
                 .spawn_scoped(scope, || -> Status
                 {
-                    return (vcpu_main(&image, physmem_range, cmdline));
+                    return (vcpu_main(&image, kmem, cmdline));
                 })
                 .map_err(RuntimeError::Thread)?;
 
@@ -119,23 +135,19 @@ run(config: &Config) -> Result<Status, RuntimeError>
         },
     );
 
-    drop(physmem);
-
     return (status);
 }
 
-/// Body of the vCPU thread: builds the boot tables and enters the kernel.
-///
-/// `physmem` is the `(address, size)` of guest physical memory, which the
-/// caller keeps mapped until the thread ends.
+/// Body of the vCPU thread: builds the boot tables and enters the kernel,
+/// which owns `kmem` until it returns.
 fn
-vcpu_main(image: &KernelImage, physmem: (u64, u64), cmdline: &[u8]) -> Status
+vcpu_main(image: &KernelImage, kmem: KernelMemory, cmdline: &[u8]) -> Status
 {
     let boot: BootInfo = BootInfo
     {
         header: TableHeader::new(size_of::<BootInfo>()),
-        physmem_base: physmem.0,
-        physmem_size: physmem.1,
+        physmem_base: kmem.physmem().base(),
+        physmem_size: kmem.physmem().size(),
         // Handles arrive with devices (M4).
         physmem_handle: HANDLE_INVALID,
         image_base: image.base(),
@@ -147,10 +159,12 @@ vcpu_main(image: &KernelImage, physmem: (u64, u64), cmdline: &[u8]) -> Status
         // Guest FPU state arrives with guest spaces (M2).
         fpu_state_size: 0,
         page_size: PAGE_SIZE,
+        kmap_base: kmem.window_base(),
+        kmap_size: kmem.window_size(),
     };
     let mut kernel: KernelOps = KernelOps::empty();
 
-    return (ops::enter(image, &mut kernel, &boot));
+    return (ops::enter(image, kmem, &mut kernel, &boot));
 }
 
 #[cfg(test)]

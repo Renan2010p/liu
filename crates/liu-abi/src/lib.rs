@@ -37,7 +37,7 @@ pub const ABI_VERSION_MAJOR: u16 = 0;
 
 /// Additive changes (new table entries appended at the end) increment the
 /// minor version.
-pub const ABI_VERSION_MINOR: u16 = 1;
+pub const ABI_VERSION_MINOR: u16 = 2;
 
 /// `b"LIU\0"` read as a little-endian `u32`.
 pub const ABI_MAGIC: u32 = 0x0055_494c;

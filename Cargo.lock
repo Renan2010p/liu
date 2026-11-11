@@ -114,6 +114,13 @@ name = "liu-elf"
 version = "0.0.0"
 
 [[package]]
+name = "liu-physmem"
+version = "0.0.0"
+dependencies = [
+ "liu-platform",
+]
+
+[[package]]
 name = "liu-platform"
 version = "0.0.0"
 dependencies = [
@@ -126,6 +133,7 @@ version = "0.0.0"
 dependencies = [
  "liu-abi",
  "liu-elf",
+ "liu-physmem",
  "liu-platform",
 ]
 

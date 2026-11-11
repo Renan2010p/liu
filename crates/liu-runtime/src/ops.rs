@@ -7,22 +7,26 @@
 //! `extern "C"` function aborts the process.
 //!
 //! Entries not served yet are left null, so the kernel sees them as absent:
-//! kernel memory arrives later in M1, address spaces and execution in M2,
-//! devices in M4.
+//! address spaces and execution arrive in M2, devices in M4.
 
 use std::io::{self, Write};
 use std::process;
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use liu_abi::status::{STATUS_INVALID, STATUS_IO, STATUS_OK};
-use liu_abi::{provides, BootInfo, HostOps, KernelEntry, KernelOps, Status};
+use liu_abi::{provides, BootInfo, Error, HostOps, KernelEntry, KernelOps, Status};
 
 use crate::cpu::{Cpu, Delivery};
 use crate::image::KernelImage;
+use crate::kmem::KernelMemory;
 
 /// The single vCPU of this kernel process.
 static CPU: Cpu = Cpu::new();
+
+/// Memory of the running kernel, owned here while it runs.
+static KMEM: Mutex<Option<KernelMemory>> = Mutex::new(None);
 
 /// The kernel's table, filled by the kernel during `liu_kernel_entry`.
 static KERNEL_OPS: AtomicPtr<KernelOps> = AtomicPtr::new(ptr::null_mut());
@@ -229,6 +233,89 @@ get_random(buf: *mut u8, len: usize) -> Status
     return (STATUS_OK);
 }
 
+/// Runs `op` on the running kernel's memory and converts the result.
+fn
+with_kmem(op: &mut dyn FnMut(&mut KernelMemory) -> Result<(), Error>) -> Status
+{
+    let mut guard: MutexGuard<'_, Option<KernelMemory>> = KMEM.lock().unwrap_or_else(PoisonError::into_inner);
+    let result: Result<(), Error> = match guard.as_mut()
+    {
+        Some(kmem) => op(kmem),
+        None => Err(Error::Invalid),
+    };
+
+    return (Error::from_result(result));
+}
+
+/// `host_ops.kmap`.
+unsafe extern "C" fn
+kmap(vaddr: u64, phys: u64, len: u64, prot: u32) -> Status
+{
+    return (with_kmem(&mut |kmem: &mut KernelMemory| -> Result<(), Error>
+    {
+        return (kmem.kmap(vaddr, phys, len, prot));
+    }));
+}
+
+/// `host_ops.kunmap`.
+unsafe extern "C" fn
+kunmap(vaddr: u64, len: u64) -> Status
+{
+    return (with_kmem(&mut |kmem: &mut KernelMemory| -> Result<(), Error>
+    {
+        return (kmem.kunmap(vaddr, len));
+    }));
+}
+
+/// `host_ops.kprotect`.
+unsafe extern "C" fn
+kprotect(vaddr: u64, len: u64, prot: u32) -> Status
+{
+    return (with_kmem(&mut |kmem: &mut KernelMemory| -> Result<(), Error>
+    {
+        return (kmem.kprotect(vaddr, len, prot));
+    }));
+}
+
+/// `host_ops.kstack_alloc`: stores the lowest usable address in `out`.
+unsafe extern "C" fn
+kstack_alloc(size: u64, out: *mut u64) -> Status
+{
+    if out.is_null()
+    {
+        return (STATUS_INVALID);
+    }
+
+    let mut base: u64 = 0;
+    let status: Status = with_kmem(&mut |kmem: &mut KernelMemory| -> Result<(), Error>
+    {
+        base = kmem.kstack_alloc(size)?;
+        return (Ok(()));
+    });
+
+    if status == STATUS_OK
+    {
+        // SAFETY: checked non-null; the ABI requires `out` to be writable.
+        unsafe
+        {
+            out.write(base);
+        }
+    }
+
+    return (status);
+}
+
+/// `host_ops.kstack_free`.
+unsafe extern "C" fn
+kstack_free(addr: u64, size: u64) -> ()
+{
+    let _: Status = with_kmem(&mut |kmem: &mut KernelMemory| -> Result<(), Error>
+    {
+        kmem.kstack_free(addr, size);
+        return (Ok(()));
+    });
+}
+
 const fn
 host_ops() -> HostOps
 {
@@ -236,6 +323,11 @@ host_ops() -> HostOps
 
     ops.log_write = Some(log_write);
     ops.panic = Some(panic);
+    ops.kmap = Some(kmap);
+    ops.kunmap = Some(kunmap);
+    ops.kprotect = Some(kprotect);
+    ops.kstack_alloc = Some(kstack_alloc);
+    ops.kstack_free = Some(kstack_free);
     ops.irq_enable = Some(irq_enable);
     ops.irq_disable = Some(irq_disable);
     ops.irq_save = Some(irq_save);
@@ -254,15 +346,17 @@ host_ops() -> HostOps
 static HOST_OPS: HostOps = host_ops();
 
 /// Calls `liu_kernel_entry` of a loaded image on the current thread, with
-/// interrupts disabled and no timer armed.
+/// interrupts disabled and no timer armed. `kmem` serves the kernel memory
+/// entries until the kernel returns, and is released then.
 ///
 /// The call returns when the kernel shuts down; the result is its status.
 /// One kernel runs per process: `enter` must not be called concurrently.
 pub fn
-enter(image: &KernelImage, kernel: &mut KernelOps, boot: &BootInfo) -> Status
+enter(image: &KernelImage, kmem: KernelMemory, kernel: &mut KernelOps, boot: &BootInfo) -> Status
 {
     let table: *mut KernelOps = kernel;
 
+    *KMEM.lock().unwrap_or_else(PoisonError::into_inner) = Some(kmem);
     CPU.reset();
     KERNEL_OPS.store(table, Ordering::SeqCst);
 
@@ -279,6 +373,8 @@ enter(image: &KernelImage, kernel: &mut KernelOps, boot: &BootInfo) -> Status
 
     KERNEL_OPS.store(ptr::null_mut(), Ordering::SeqCst);
     CPU.reset();
+    // Unmaps the window, physical memory and every stack.
+    drop(KMEM.lock().unwrap_or_else(PoisonError::into_inner).take());
 
     return (status);
 }
