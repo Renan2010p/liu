@@ -124,3 +124,19 @@ probe() -> io::Result<Capabilities>
 
     return (Ok(caps));
 }
+
+/// Reads up to `buf.len()` random bytes with `getrandom(2)`.
+pub(crate) fn
+random_chunk(buf: &mut [u8]) -> io::Result<usize>
+{
+    // SAFETY: `buf` is valid for writes of `buf.len()` bytes.
+    let ret: libc::ssize_t =
+        unsafe { libc::getrandom(buf.as_mut_ptr().cast::<libc::c_void>(), buf.len(), 0) };
+
+    if ret < 0
+    {
+        return (Err(io::Error::last_os_error()));
+    }
+
+    return (Ok(ret as usize));
+}

@@ -9,6 +9,7 @@
 #![deny(unsafe_code)]
 
 pub mod config;
+pub mod cpu;
 pub mod image;
 #[allow(unsafe_code)]
 pub mod ops;

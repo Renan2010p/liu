@@ -137,3 +137,15 @@ probe() -> io::Result<Capabilities>
 
     return (Ok(caps));
 }
+
+/// Reads up to 256 random bytes with `getentropy(3)`, the portable limit.
+pub(crate) fn
+random_chunk(buf: &mut [u8]) -> io::Result<usize>
+{
+    let len: usize = buf.len().min(256);
+
+    // SAFETY: `buf` is valid for writes of `len` bytes.
+    sys::check(unsafe { libc::getentropy(buf.as_mut_ptr().cast::<libc::c_void>(), len) })?;
+
+    return (Ok(len));
+}

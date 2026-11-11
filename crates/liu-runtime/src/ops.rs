@@ -7,14 +7,25 @@
 //! `extern "C"` function aborts the process.
 //!
 //! Entries not served yet are left null, so the kernel sees them as absent:
-//! address spaces and execution arrive in M2, devices in M4.
+//! kernel memory arrives later in M1, address spaces and execution in M2,
+//! devices in M4.
 
 use std::io::{self, Write};
 use std::process;
+use std::ptr;
+use std::sync::atomic::{AtomicPtr, Ordering};
 
-use liu_abi::{BootInfo, HostOps, KernelEntry, KernelOps, Status};
+use liu_abi::status::{STATUS_INVALID, STATUS_IO, STATUS_OK};
+use liu_abi::{provides, BootInfo, HostOps, KernelEntry, KernelOps, Status};
 
+use crate::cpu::{Cpu, Delivery};
 use crate::image::KernelImage;
+
+/// The single vCPU of this kernel process.
+static CPU: Cpu = Cpu::new();
+
+/// The kernel's table, filled by the kernel during `liu_kernel_entry`.
+static KERNEL_OPS: AtomicPtr<KernelOps> = AtomicPtr::new(ptr::null_mut());
 
 /// Exit status of the kernel process after `host_ops.panic`.
 pub const EXIT_KERNEL_PANIC: i32 = 3;
@@ -66,6 +77,158 @@ panic(msg: *const u8, len: usize) -> ()
     process::exit(EXIT_KERNEL_PANIC);
 }
 
+/// Runs the kernel's handlers for what is due. Entries the kernel did not
+/// register are skipped, and a table with a bad header is ignored.
+fn
+dispatch(due: Delivery) -> ()
+{
+    let table: *mut KernelOps = KERNEL_OPS.load(Ordering::SeqCst);
+
+    if table.is_null()
+    {
+        return;
+    }
+
+    // SAFETY: `KERNEL_OPS` points to the table `enter` passed to the
+    // kernel, which outlives the kernel; it is only accessed through raw
+    // pointers, and copying it does not create a lasting reference.
+    let kernel: KernelOps = unsafe { ptr::read(table) };
+
+    if kernel.header.check().is_err()
+    {
+        return;
+    }
+    if due.timer && provides!(kernel, KernelOps, timer)
+    {
+        if let Some(timer) = kernel.timer
+        {
+            // SAFETY: the kernel registered this entry point.
+            unsafe
+            {
+                timer();
+            }
+        }
+    }
+    if due.irqs != 0 && provides!(kernel, KernelOps, irq)
+    {
+        if let Some(irq) = kernel.irq
+        {
+            // SAFETY: the kernel registered this entry point.
+            unsafe
+            {
+                irq(due.irqs);
+            }
+        }
+    }
+}
+
+/// A safe point: delivers what is due if interrupts are enabled.
+fn
+safe_point() -> ()
+{
+    CPU.deliver(&liu_platform::clock_monotonic_ns, &mut dispatch);
+}
+
+/// `host_ops.irq_enable`.
+unsafe extern "C" fn
+irq_enable() -> ()
+{
+    CPU.set_enabled(true);
+    safe_point();
+}
+
+/// `host_ops.irq_disable`.
+unsafe extern "C" fn
+irq_disable() -> ()
+{
+    CPU.set_enabled(false);
+}
+
+/// `host_ops.irq_save`: disables interrupts; returns 1 if they were enabled.
+unsafe extern "C" fn
+irq_save() -> u64
+{
+    return (CPU.set_enabled(false) as u64);
+}
+
+/// `host_ops.irq_restore`: bit 0 of `flags` is the state to restore.
+unsafe extern "C" fn
+irq_restore(flags: u64) -> ()
+{
+    if flags & 1 != 0
+    {
+        CPU.set_enabled(true);
+        safe_point();
+    }
+    else
+    {
+        CPU.set_enabled(false);
+    }
+}
+
+/// `host_ops.idle`: blocks until an interrupt is due, then delivers it.
+unsafe extern "C" fn
+idle() -> ()
+{
+    CPU.wait(&liu_platform::clock_monotonic_ns);
+    CPU.set_enabled(true);
+    safe_point();
+}
+
+/// `host_ops.clock_monotonic`.
+unsafe extern "C" fn
+clock_monotonic() -> u64
+{
+    return (liu_platform::clock_monotonic_ns());
+}
+
+/// `host_ops.clock_realtime`.
+unsafe extern "C" fn
+clock_realtime() -> u64
+{
+    return (liu_platform::clock_realtime_ns());
+}
+
+/// `host_ops.timer_set`: arms the one-shot timer.
+unsafe extern "C" fn
+timer_set(deadline: u64) -> Status
+{
+    CPU.set_timer(deadline);
+    return (STATUS_OK);
+}
+
+/// `host_ops.timer_cancel`.
+unsafe extern "C" fn
+timer_cancel() -> ()
+{
+    CPU.cancel_timer();
+}
+
+/// `host_ops.get_random`: fills `buf` with host entropy.
+unsafe extern "C" fn
+get_random(buf: *mut u8, len: usize) -> Status
+{
+    if len == 0
+    {
+        return (STATUS_OK);
+    }
+    if buf.is_null()
+    {
+        return (STATUS_INVALID);
+    }
+
+    // SAFETY: the ABI requires `buf` to point to `len` writable bytes that
+    // nothing else accesses during the call.
+    let bytes: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(buf, len) };
+
+    if liu_platform::fill_random(bytes).is_err()
+    {
+        return (STATUS_IO);
+    }
+
+    return (STATUS_OK);
+}
+
 const fn
 host_ops() -> HostOps
 {
@@ -73,6 +236,16 @@ host_ops() -> HostOps
 
     ops.log_write = Some(log_write);
     ops.panic = Some(panic);
+    ops.irq_enable = Some(irq_enable);
+    ops.irq_disable = Some(irq_disable);
+    ops.irq_save = Some(irq_save);
+    ops.irq_restore = Some(irq_restore);
+    ops.idle = Some(idle);
+    ops.clock_monotonic = Some(clock_monotonic);
+    ops.clock_realtime = Some(clock_realtime);
+    ops.timer_set = Some(timer_set);
+    ops.timer_cancel = Some(timer_cancel);
+    ops.get_random = Some(get_random);
 
     return (ops);
 }
@@ -80,12 +253,19 @@ host_ops() -> HostOps
 /// The table handed to the kernel. It lives for the whole process.
 static HOST_OPS: HostOps = host_ops();
 
-/// Calls `liu_kernel_entry` of a loaded image on the current thread.
+/// Calls `liu_kernel_entry` of a loaded image on the current thread, with
+/// interrupts disabled and no timer armed.
 ///
 /// The call returns when the kernel shuts down; the result is its status.
+/// One kernel runs per process: `enter` must not be called concurrently.
 pub fn
 enter(image: &KernelImage, kernel: &mut KernelOps, boot: &BootInfo) -> Status
 {
+    let table: *mut KernelOps = kernel;
+
+    CPU.reset();
+    KERNEL_OPS.store(table, Ordering::SeqCst);
+
     // SAFETY: `KernelImage` guarantees that `entry` lies in an executable
     // segment of an image that stays mapped while `image` is borrowed, and
     // the image was validated as an x86_64 kernel whose entry point is
@@ -95,7 +275,10 @@ enter(image: &KernelImage, kernel: &mut KernelOps, boot: &BootInfo) -> Status
 
     // SAFETY: the three tables are valid for the duration of the call:
     // `HOST_OPS` is static and the others are borrowed for it.
-    let status: Status = unsafe { entry(&HOST_OPS, kernel, boot) };
+    let status: Status = unsafe { entry(&HOST_OPS, table, boot) };
+
+    KERNEL_OPS.store(ptr::null_mut(), Ordering::SeqCst);
+    CPU.reset();
 
     return (status);
 }

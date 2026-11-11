@@ -16,13 +16,25 @@
 
 use core::fmt::{self, Write};
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 
 use liu_abi::status::{STATUS_INVALID, STATUS_OK, STATUS_UNSUPPORTED};
 use liu_abi::{provides, BootInfo, HostOps, KernelOps, Status, PAGE_SIZE};
 
-/// The host table, kept for the panic handler.
+/// The host table, kept for the panic and timer handlers.
 static HOST: AtomicPtr<HostOps> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Number of `kernel_ops.timer` calls.
+static TICKS: AtomicU32 = AtomicU32::new(0);
+
+/// Set when a handler ran with interrupts enabled.
+static HANDLER_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// 2020-01-01T00:00:00Z in nanoseconds.
+const YEAR_2020_NS: u64 = 1_577_836_800 * 1_000_000_000;
+
+/// Delay of the idle test, in nanoseconds.
+const IDLE_DELAY_NS: u64 = 10_000_000;
 
 /// Console that writes through `host_ops.log_write`.
 struct Console<'a>
@@ -49,23 +61,54 @@ impl Write for Console<'_>
     }
 }
 
-/// Runs every check and returns the status the entry point reports.
+/// A host entry the test needs is missing.
+struct Missing(&'static str);
+
+/// One conformance check: `Ok(true)` passed, `Ok(false)` failed.
+type Check = fn(&mut Console, &HostOps) -> Result<bool, Missing>;
+
+/// Returns a host entry or the name of the missing one.
 fn
-run(host: &HostOps, kernel: &mut KernelOps, boot: &BootInfo) -> Status
+need<T>(entry: Option<T>, name: &'static str) -> Result<T, Missing>
 {
-    let mut con: Console = Console { host: host };
+    return (entry.ok_or(Missing(name)));
+}
 
-    let _: fmt::Result = writeln!(con, "abi-kernel: hello from the LIU ABI test kernel");
+/// `kernel_ops.timer`: counts ticks and records the interrupt state.
+unsafe extern "C" fn
+on_timer() -> ()
+{
+    let host: *mut HostOps = HOST.load(Ordering::Relaxed);
 
+    // SAFETY: `HOST` is set before interrupts can be enabled and points to
+    // the runtime's static table.
+    if let Some(irq_save) = unsafe { (*host).irq_save }
+    {
+        // SAFETY: a host entry with no arguments. Saving does not change
+        // the state inside a handler, where interrupts must be disabled.
+        let flags: u64 = unsafe { irq_save() };
+
+        if flags != 0
+        {
+            HANDLER_ENABLED.store(true, Ordering::Relaxed);
+        }
+    }
+    TICKS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Boot information and the command line.
+fn
+check_boot(con: &mut Console, boot: &BootInfo) -> bool
+{
     if boot.header.check().is_err()
     {
         let _: fmt::Result = writeln!(con, "abi-kernel: FAIL boot info header");
-        return (STATUS_INVALID);
+        return (false);
     }
     if boot.page_size != PAGE_SIZE
     {
         let _: fmt::Result = writeln!(con, "abi-kernel: FAIL page size {}", boot.page_size);
-        return (STATUS_INVALID);
+        return (false);
     }
 
     let entry: u64 = liu_kernel_entry as *const () as usize as u64;
@@ -73,7 +116,7 @@ run(host: &HostOps, kernel: &mut KernelOps, boot: &BootInfo) -> Status
     if entry < boot.image_base || entry >= boot.image_base + boot.image_size
     {
         let _: fmt::Result = writeln!(con, "abi-kernel: FAIL entry {:#x} outside the image", entry);
-        return (STATUS_INVALID);
+        return (false);
     }
     let _: fmt::Result = writeln!(con, "abi-kernel: image {:#x} + {:#x}", boot.image_base, boot.image_size);
     let _: fmt::Result = writeln!(
@@ -96,10 +139,179 @@ run(host: &HostOps, kernel: &mut KernelOps, boot: &BootInfo) -> Status
     let text: &str = core::str::from_utf8(cmdline).unwrap_or("<not utf-8>");
 
     let _: fmt::Result = writeln!(con, "abi-kernel: cmdline \"{}\"", text);
+    return (true);
+}
 
-    *kernel = KernelOps::empty();
+/// `clock_monotonic` and `clock_realtime`.
+fn
+check_clocks(con: &mut Console, host: &HostOps) -> Result<bool, Missing>
+{
+    let monotonic: unsafe extern "C" fn() -> u64 = need(host.clock_monotonic, "clock_monotonic")?;
+    let realtime: unsafe extern "C" fn() -> u64 = need(host.clock_realtime, "clock_realtime")?;
+
+    // SAFETY: host entries with no arguments.
+    let (first, second, wall): (u64, u64, u64) = unsafe { (monotonic(), monotonic(), realtime()) };
+
+    if second < first || wall < YEAR_2020_NS
+    {
+        let _: fmt::Result = writeln!(con, "abi-kernel: FAIL clocks {} {} {}", first, second, wall);
+        return (Ok(false));
+    }
+    let _: fmt::Result = writeln!(con, "abi-kernel: clocks ok (realtime {} s)", wall / 1_000_000_000);
+    return (Ok(true));
+}
+
+/// `get_random`.
+fn
+check_random(con: &mut Console, host: &HostOps) -> Result<bool, Missing>
+{
+    let random: unsafe extern "C" fn(*mut u8, usize) -> Status = need(host.get_random, "get_random")?;
+    let mut a: [u8; 64] = [0; 64];
+    let mut b: [u8; 64] = [0; 64];
+
+    // SAFETY: both buffers are valid for writes of their length; the null
+    // buffer must be refused without being written.
+    let status: (Status, Status, Status) = unsafe
+    {
+        (random(a.as_mut_ptr(), a.len()), random(b.as_mut_ptr(), b.len()), random(core::ptr::null_mut(), 8))
+    };
+
+    if status != (STATUS_OK, STATUS_OK, STATUS_INVALID) || a == b || a == [0; 64]
+    {
+        let _: fmt::Result = writeln!(con, "abi-kernel: FAIL get_random {:?}", status);
+        return (Ok(false));
+    }
+    let _: fmt::Result = writeln!(con, "abi-kernel: random ok");
+    return (Ok(true));
+}
+
+/// Interrupt flags, the one-shot timer, `idle` and delivery at safe points.
+fn
+check_timer(con: &mut Console, host: &HostOps) -> Result<bool, Missing>
+{
+    let now: unsafe extern "C" fn() -> u64 = need(host.clock_monotonic, "clock_monotonic")?;
+    let enable: unsafe extern "C" fn() -> () = need(host.irq_enable, "irq_enable")?;
+    let disable: unsafe extern "C" fn() -> () = need(host.irq_disable, "irq_disable")?;
+    let save: unsafe extern "C" fn() -> u64 = need(host.irq_save, "irq_save")?;
+    let restore: unsafe extern "C" fn(u64) -> () = need(host.irq_restore, "irq_restore")?;
+    let idle: unsafe extern "C" fn() -> () = need(host.idle, "idle")?;
+    let set: unsafe extern "C" fn(u64) -> Status = need(host.timer_set, "timer_set")?;
+    let cancel: unsafe extern "C" fn() -> () = need(host.timer_cancel, "timer_cancel")?;
+
+    // SAFETY: every call below is a host entry taking plain integers, made
+    // from the vCPU thread the kernel was entered on.
+    unsafe
+    {
+        // Interrupts start disabled.
+        let at_entry: u64 = save();
+
+        restore(1);
+        let enabled: u64 = save();
+
+        restore(0);
+        if at_entry != 0 || enabled != 1
+        {
+            let _: fmt::Result = writeln!(con, "abi-kernel: FAIL irq flags {} {}", at_entry, enabled);
+            return (Ok(false));
+        }
+
+        // idle() sleeps until the deadline, then the handler runs.
+        let start: u64 = now();
+
+        enable();
+        if set(start + IDLE_DELAY_NS) != STATUS_OK
+        {
+            let _: fmt::Result = writeln!(con, "abi-kernel: FAIL timer_set");
+            return (Ok(false));
+        }
+        idle();
+
+        let slept: u64 = now() - start;
+
+        if TICKS.load(Ordering::Relaxed) != 1 || slept < IDLE_DELAY_NS
+        {
+            let _: fmt::Result = writeln!(
+                con,
+                "abi-kernel: FAIL idle: {} ticks after {} us",
+                TICKS.load(Ordering::Relaxed),
+                slept / 1000
+            );
+            return (Ok(false));
+        }
+        let _: fmt::Result = writeln!(con, "abi-kernel: idle woke after {} us", slept / 1000);
+
+        // An expired timer waits while interrupts are disabled and is
+        // delivered when they are enabled again.
+        disable();
+        set(now());
+        let held: u32 = TICKS.load(Ordering::Relaxed);
+
+        enable();
+        let delivered: u32 = TICKS.load(Ordering::Relaxed);
+
+        // A cancelled timer never fires.
+        set(now() + 1_000_000);
+        cancel();
+        let spin_until: u64 = now() + 3_000_000;
+
+        while now() < spin_until
+        {
+            enable();
+        }
+        let after_cancel: u32 = TICKS.load(Ordering::Relaxed);
+
+        disable();
+        if held != 1 || delivered != 2 || after_cancel != 2 || HANDLER_ENABLED.load(Ordering::Relaxed)
+        {
+            let _: fmt::Result = writeln!(
+                con,
+                "abi-kernel: FAIL timer delivery: held {} delivered {} after cancel {} nested {}",
+                held,
+                delivered,
+                after_cancel,
+                HANDLER_ENABLED.load(Ordering::Relaxed)
+            );
+            return (Ok(false));
+        }
+    }
+    let _: fmt::Result = writeln!(con, "abi-kernel: timer ok (safe points, cancel, handlers disabled)");
+    return (Ok(true));
+}
+
+/// Runs every check and returns the status the entry point reports.
+fn
+run(host: &HostOps, boot: &BootInfo) -> Status
+{
+    let mut con: Console = Console { host: host };
+    let _: fmt::Result = writeln!(con, "abi-kernel: hello from the LIU ABI test kernel");
+
+    if !check_boot(&mut con, boot)
+    {
+        return (STATUS_INVALID);
+    }
+
+    let checks: [Check; 3] = [check_clocks, check_random, check_timer];
+
+    for check in checks
+    {
+        match check(&mut con, host)
+        {
+            Ok(true) =>
+            {
+            }
+            Ok(false) =>
+            {
+                return (STATUS_INVALID);
+            }
+            Err(Missing(name)) =>
+            {
+                let _: fmt::Result = writeln!(con, "abi-kernel: FAIL host does not provide {}", name);
+                return (STATUS_UNSUPPORTED);
+            }
+        }
+    }
+
     let _: fmt::Result = writeln!(con, "abi-kernel: pass");
-
     return (STATUS_OK);
 }
 
@@ -130,9 +342,20 @@ liu_kernel_entry(host: *const HostOps, kernel: *mut KernelOps, boot: *const Boot
     }
     HOST.store(host.cast_mut(), Ordering::Relaxed);
 
-    // SAFETY: checked non-null; the caller guarantees validity and that no
-    // other reference to these tables exists during the call.
-    let status: Status = unsafe { run(host_ref, &mut *kernel, &*boot) };
+    let mut ops: KernelOps = KernelOps::empty();
+
+    ops.timer = Some(on_timer);
+
+    // SAFETY: checked non-null. The table is written once through the raw
+    // pointer and no reference to it is kept, since the runtime reads it
+    // while the kernel runs.
+    unsafe
+    {
+        kernel.write(ops);
+    }
+
+    // SAFETY: checked non-null; the caller guarantees validity.
+    let status: Status = unsafe { run(host_ref, &*boot) };
 
     return (status);
 }

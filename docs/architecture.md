@@ -224,6 +224,9 @@ sequenceDiagram
   Linux's interrupt path the way UML does for `SIGIO` and `SIGALRM` today.
 - The Linux kernel never calls `sigaction`, `timer_create`, `kqueue` or `epoll`
   itself. It asks the runtime through the host ABI.
+- Until M3, interrupts are delivered only at safe points (`irq_enable`,
+  `irq_restore`, the return from `idle`) and the timer needs no event thread
+  ([ADR 0008](adr/0008-interrupts-at-safe-points.md)).
 
 ```mermaid
 sequenceDiagram
@@ -686,7 +689,7 @@ are generic (D5).
 | Unit | ABI layout and negotiation, ELF validation, style rules | `cargo test` ✅ |
 | Platform | shared memory, processes, Capsicum, `PT_SET_SC_RET` on the running kernel | `crates/liu-platform/tests` ✅ |
 | ABI drift | regenerate `host.h` and fail on diff; compile a C probe and compare every offset | `cargo xtask check-header`, `check-abi` ✅ |
-| ABI conformance | a freestanding Rust test kernel that calls every `host_ops` entry | `cargo xtask test-abi` 🔨 (M1: console done) |
+| ABI conformance | a freestanding Rust test kernel that calls every `host_ops` entry | `cargo xtask test-abi` 🔨 (M1: console, time, random, cpu done) |
 | Trap backends | static programs in a guest space: syscalls, faults, signals | `tests/trap/` (M2) |
 | Boot | boot `liu_defconfig` to a busybox initramfs and script a shell session | `cargo xtask test-boot` (M3) |
 | Compatibility | selected Linux Test Project suites inside the guest | nightly (M5) |

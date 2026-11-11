@@ -122,9 +122,13 @@ the `x86_64-unknown-none` target (`rustup target add x86_64-unknown-none`):
 ```text
 $ cargo xtask test-abi
 abi-kernel: hello from the LIU ABI test kernel
-abi-kernel: image 0x60000000 + 0x5000
+abi-kernel: image 0x60000000 + 0x6000
 abi-kernel: physmem 32 MiB at 0x60200000
 abi-kernel: cmdline "console=hvc0 liu.test=abi"
+abi-kernel: clocks ok (realtime 1794408338 s)
+abi-kernel: random ok
+abi-kernel: idle woke after 10022 us
+abi-kernel: timer ok (safe points, cancel, handlers disabled)
 abi-kernel: pass
 test-abi: passed
 ```
