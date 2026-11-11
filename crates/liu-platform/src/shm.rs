@@ -8,6 +8,7 @@ use std::ptr::{self, NonNull};
 
 use crate::host;
 use crate::sys;
+use crate::vm;
 
 /// Memory protection for a mapping.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -35,7 +36,7 @@ impl Protection
         return (self.0 & other.0 == other.0);
     }
 
-    fn
+    pub(crate) fn
     to_host(self) -> libc::c_int
     {
         let mut prot: libc::c_int = libc::PROT_NONE;
@@ -149,6 +150,32 @@ impl SharedMemory
                 return (Err(io::Error::other("mmap returned a null mapping")));
             }
         };
+
+        return (Ok(Mapping { base: base, len: len }));
+    }
+    /// Maps `len` bytes starting at `offset` at exactly `addr`.
+    ///
+    /// Fails with `AddrInUse` if any part of the range is already mapped.
+    pub fn
+    map_at(&self, offset: u64, len: usize, prot: Protection, addr: u64) -> io::Result<Mapping>
+    {
+        let end: Option<u64> = offset.checked_add(len as u64);
+
+        if len == 0 || end.is_none() || end.unwrap_or(u64::MAX) > self.size
+        {
+            return (Err(io::Error::from(io::ErrorKind::InvalidInput)));
+        }
+
+        let host_offset: libc::off_t = match libc::off_t::try_from(offset)
+        {
+            Ok(host_offset) => host_offset,
+            Err(_) =>
+            {
+                return (Err(io::Error::from(io::ErrorKind::InvalidInput)));
+            }
+        };
+        let base: NonNull<u8> =
+            vm::map_exact(addr, len, prot, libc::MAP_SHARED, self.fd.as_raw_fd(), host_offset)?;
 
         return (Ok(Mapping { base: base, len: len }));
     }

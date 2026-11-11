@@ -20,6 +20,7 @@ mod caps;
 mod process;
 mod shm;
 mod sys;
+mod vm;
 
 #[cfg(target_os = "freebsd")]
 pub mod freebsd;
@@ -41,6 +42,7 @@ use std::io;
 pub use caps::{Capabilities, HostOs, RenuxExtensions, SandboxKind, TrapBackendKind};
 pub use process::{Child, ForkResult, WaitStatus};
 pub use shm::{Mapping, Protection, SharedMemory};
+pub use vm::{page_size, Region};
 
 /// Inspects the running host and reports what LIU can use on it.
 ///

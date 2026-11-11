@@ -68,6 +68,8 @@ impl Drop for Mapping
 - Every `unsafe` block carries a `// SAFETY:` comment.
 - `unsafe` is allowed only in `liu-platform`, `liu-physmem`, `liu-trap` and the
   `host_ops` glue of `liu-runtime`; other crates use `#![forbid(unsafe_code)]`.
+  `tests/abi-kernel` plays the kernel side, so like the C in `kernel/` it
+  handles raw pointers from the boundary.
 - `#[cfg(target_os = ...)]` is allowed only in `liu-platform`.
 - Lines are at most 100 columns where practical.
 

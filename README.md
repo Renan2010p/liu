@@ -116,6 +116,18 @@ cargo xtask ci
 `cargo xtask ci` runs the style check, clippy, the tests (which exercise the
 running kernel: ptrace, Capsicum, shared memory), the C header check and a
 compile-time check for Linux. On Renux it also verifies `PT_SET_SC_RET`.
+It also boots the freestanding ABI test kernel under the runtime, which needs
+the `x86_64-unknown-none` target (`rustup target add x86_64-unknown-none`):
+
+```text
+$ cargo xtask test-abi
+abi-kernel: hello from the LIU ABI test kernel
+abi-kernel: image 0x60000000 + 0x5000
+abi-kernel: physmem 32 MiB at 0x60200000
+abi-kernel: cmdline "console=hvc0 liu.test=abi"
+abi-kernel: pass
+test-abi: passed
+```
 
 ```text
 $ cargo test -p liu-platform -- --nocapture
@@ -129,6 +141,8 @@ crates/
   liu-abi/        host ABI: tables, registers, traps, status codes   no_std
   liu-elf/        ELF64 parser and kernel image load planner         no_std
   liu-platform/   probing, shared memory, processes, ptrace, sandbox
+  liu-runtime/    the kernel process (liu-kernel): loader, host_ops
+tests/abi-kernel/ freestanding test kernel for the ABI suite         no_std
 kernel/           Linux side; generated include/liu/host.h           GPL-2.0
 xtask/            gen-header · check-abi · style · ci
 docs/             architecture, decisions, style

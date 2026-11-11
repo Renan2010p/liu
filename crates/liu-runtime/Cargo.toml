@@ -1,0 +1,20 @@
+[package]
+name = "liu-runtime"
+description = "LIU kernel process: loads the freestanding kernel image and serves the host ABI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "liu-kernel"
+path = "src/main.rs"
+
+[dependencies]
+liu-abi.workspace = true
+liu-elf.workspace = true
+liu-platform.workspace = true
+
+[lints]
+workspace = true

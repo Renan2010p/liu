@@ -6,9 +6,12 @@
 //!     cargo xtask check-header   fail if host.h is out of date
 //!     cargo xtask check-abi      compare the C layout of host.h with liu-abi
 //!     cargo xtask style          check the KNF style rules (docs/style.md)
+//!     cargo xtask abi-kernel     build the ABI test kernel (tests/abi-kernel)
+//!     cargo xtask test-abi       run the ABI test kernel under liu-runtime
 //!     cargo xtask ci             run every check the CI runs
 
 mod abi;
+mod abi_kernel;
 mod header;
 mod style;
 
@@ -89,7 +92,7 @@ cross_check() -> TaskResult
             continue;
         }
         run("cargo", &["check", "--quiet", "-p", "liu-platform", "-p", "liu-abi", "-p", "liu-elf",
-            "--all-targets", "--target", target])?;
+            "-p", "liu-runtime", "--all-targets", "--target", target])?;
 
         return (Ok(()));
     }
@@ -104,6 +107,8 @@ ci() -> TaskResult
     style::check(&root())?;
     run("cargo", &["clippy", "--quiet", "--workspace", "--all-targets", "--", "-D", "warnings"])?;
     run("cargo", &["test", "--quiet", "--workspace"])?;
+    abi_kernel::clippy(&root())?;
+    abi_kernel::test(&root())?;
     header::check(&root())?;
     abi::check(&root())?;
     cross_check()?;
@@ -116,7 +121,7 @@ fn
 usage() -> TaskResult
 {
     return (Err(String::from(
-        "usage: cargo xtask <gen-header | check-header | check-abi | style | ci>",
+        "usage: cargo xtask <gen-header | check-header | check-abi | style | abi-kernel | test-abi | ci>",
     )));
 }
 
@@ -135,6 +140,8 @@ main() -> ExitCode
         "check-header" => header::check(&root()),
         "check-abi" => abi::check(&root()),
         "style" => style::check(&root()),
+        "abi-kernel" => abi_kernel::build(&root()),
+        "test-abi" => abi_kernel::test(&root()),
         "ci" => ci(),
         _ => usage(),
     };

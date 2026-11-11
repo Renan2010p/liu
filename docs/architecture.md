@@ -549,7 +549,7 @@ liu/
 │   │   └── src/{freebsd/, linux/, generic.rs}
 │   ├── liu-physmem/      bounds-checked guest physical memory access
 │   ├── liu-trap/         guest stub and host-independent trap handling
-│   ├── liu-runtime/      kernel process: loader, host_ops, vCPU, events
+│   ├── liu-runtime/      kernel process: loader, host_ops, vCPU, events          🔨
 │   ├── liu-vhost/        vhost-user protocol and virtqueues
 │   ├── liu-dev-*/        device backends: console, blk, net, fs, rng
 │   ├── liu-config/       instance configuration
@@ -582,6 +582,7 @@ Rules:
 
 - `unsafe` is allowed only in `liu-platform`, `liu-physmem`, `liu-trap` and the
   `host_ops` glue of `liu-runtime`. Other crates use `#![forbid(unsafe_code)]`.
+  `tests/abi-kernel` plays the kernel side and is exempt, like the C in `kernel/`.
 - `#[cfg(target_os = ...)]` is allowed only in `liu-platform`.
 - `liu-abi` and `liu-elf` are `no_std`, so the stub and test kernels can use them.
 - All Rust code follows [KNF](style.md).
@@ -685,7 +686,7 @@ are generic (D5).
 | Unit | ABI layout and negotiation, ELF validation, style rules | `cargo test` ✅ |
 | Platform | shared memory, processes, Capsicum, `PT_SET_SC_RET` on the running kernel | `crates/liu-platform/tests` ✅ |
 | ABI drift | regenerate `host.h` and fail on diff; compile a C probe and compare every offset | `cargo xtask check-header`, `check-abi` ✅ |
-| ABI conformance | a freestanding Rust test kernel that calls every `host_ops` entry | `tests/abi-kernel/` (M1) |
+| ABI conformance | a freestanding Rust test kernel that calls every `host_ops` entry | `cargo xtask test-abi` 🔨 (M1: console done) |
 | Trap backends | static programs in a guest space: syscalls, faults, signals | `tests/trap/` (M2) |
 | Boot | boot `liu_defconfig` to a busybox initramfs and script a shell session | `cargo xtask test-boot` (M3) |
 | Compatibility | selected Linux Test Project suites inside the guest | nightly (M5) |

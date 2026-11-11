@@ -12,6 +12,12 @@ use crate::caps::{Capabilities, RenuxExtensions, SandboxKind, TrapBackendKind};
 use crate::process::{Child, ForkResult};
 use crate::sys;
 
+/// `mmap` flags: place exactly at the address, fail if it is in use.
+pub(crate) const MAP_FIXED_NOREPLACE: libc::c_int = libc::MAP_FIXED | libc::MAP_EXCL;
+
+/// `errno` from `mmap` with `MAP_EXCL` when the range is already mapped.
+pub(crate) const MAP_IN_USE_ERRNO: libc::c_int = libc::ENOMEM;
+
 pub(crate) fn
 shm_create_anonymous() -> io::Result<OwnedFd>
 {

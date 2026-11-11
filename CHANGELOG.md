@@ -15,3 +15,11 @@ All notable changes to LIU are documented here.
   memory, process creation with process descriptors, Capsicum sandbox, native
   FreeBSD ptrace wrappers and the Renux `PT_SET_SC_RET` primitive.
 - `xtask`: `gen-header`, `check-header`, `check-abi`, `style`, `ci`.
+- `liu-platform`: fixed-address memory (`Region`, `SharedMemory::map_at`)
+  that never replaces an existing mapping, and `page_size`.
+- `liu-runtime` and the `liu-kernel` binary (M1, first slice): loads a
+  freestanding kernel image at its link address with per-segment
+  permissions, maps guest physical memory after it, builds `BootInfo` and
+  enters `liu_kernel_entry` on a vCPU thread. Serves `log_write` and `panic`.
+- `tests/abi-kernel`: freestanding `no_std` test kernel linked at
+  `0x60000000` like arch/um, run by `cargo xtask test-abi` in CI.

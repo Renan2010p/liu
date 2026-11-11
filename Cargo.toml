@@ -4,8 +4,11 @@ members = [
     "crates/liu-abi",
     "crates/liu-elf",
     "crates/liu-platform",
+    "crates/liu-runtime",
     "xtask",
 ]
+# Freestanding, built for x86_64-unknown-none by `cargo xtask abi-kernel`.
+exclude = ["tests/abi-kernel"]
 
 [workspace.package]
 version = "0.0.0"

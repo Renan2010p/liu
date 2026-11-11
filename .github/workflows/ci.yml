@@ -13,6 +13,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+          targets: x86_64-unknown-none
       - run: cargo xtask ci
 
   freebsd:
@@ -23,5 +24,11 @@ jobs:
         with:
           release: "15.1"
           usesh: true
-          prepare: pkg install -y rust
-          run: cargo xtask ci
+          # The pkg toolchain has no x86_64-unknown-none standard library,
+          # which the ABI test kernel needs, so install through rustup.
+          prepare: |
+            pkg install -y rustup-init
+            rustup-init -y --profile minimal -c clippy -t x86_64-unknown-none
+          run: |
+            . "$HOME/.cargo/env"
+            cargo xtask ci

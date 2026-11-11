@@ -1,0 +1,40 @@
+[package]
+name = "abi-kernel"
+description = "Freestanding test kernel for the LIU host ABI conformance suite"
+version = "0.0.0"
+edition = "2021"
+license = "MPL-2.0"
+publish = false
+
+# Built only for x86_64-unknown-none by `cargo xtask abi-kernel`, so it is not
+# a member of the host workspace.
+[workspace]
+
+[[bin]]
+name = "abi-kernel"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+liu-abi = { path = "../../crates/liu-abi" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+debug = true
+
+# Same KNF exceptions as the workspace (see docs/style.md).
+[lints.rust]
+unused_parens = "allow"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+needless_return = "allow"
+unused_unit = "allow"
+let_and_return = "allow"
+redundant_field_names = "allow"
+undocumented_unsafe_blocks = "warn"

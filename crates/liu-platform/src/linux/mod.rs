@@ -12,6 +12,14 @@ use crate::sys;
 
 const MFD_CLOEXEC: libc::c_uint = 0x0001;
 
+/// `mmap` flags: place exactly at the address, fail if it is in use. Kernels
+/// before 4.17 ignore the flag and treat the address as a hint, which
+/// `vm::map_exact` detects.
+pub(crate) const MAP_FIXED_NOREPLACE: libc::c_int = libc::MAP_FIXED_NOREPLACE;
+
+/// `errno` from `mmap` with `MAP_FIXED_NOREPLACE` when the range is in use.
+pub(crate) const MAP_IN_USE_ERRNO: libc::c_int = libc::EEXIST;
+
 pub(crate) fn
 shm_create_anonymous() -> io::Result<OwnedFd>
 {

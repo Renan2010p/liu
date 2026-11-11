@@ -14,6 +14,14 @@ use crate::sys;
 
 static SHM_COUNTER: AtomicU32 = AtomicU32::new(0);
 
+/// POSIX has no "fixed, no replace" flag: the address is only a hint, and
+/// `vm::map_exact` refuses a mapping placed elsewhere.
+pub(crate) const MAP_FIXED_NOREPLACE: libc::c_int = 0;
+
+/// Never returned: without the flag, an occupied range shows up as a
+/// mapping at another address.
+pub(crate) const MAP_IN_USE_ERRNO: libc::c_int = -1;
+
 /// POSIX has no anonymous shared memory object: create a uniquely named one
 /// and unlink it immediately, leaving only the descriptor.
 pub(crate) fn
