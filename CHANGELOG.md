@@ -45,5 +45,10 @@ All notable changes to LIU are documented here.
   and physmem mapped by `GuestSpace::map`; address-space changes
   (`map`, `unmap`, `protect`) are validated, queued and applied in batches
   of up to 63 by the stub.
+- `liu-runtime`: the address-space group of `host_ops` (`as_create`,
+  `as_destroy`, `as_map`, `as_unmap`, `as_protect`, `as_flush`, `as_run`)
+  on the host's trap backend; `as_create` reports `STATUS_UNSUPPORTED` on
+  hosts without one. The ABI test kernel runs a static Linux program in a
+  guest space on Renux, with demand paging, `write` and `exit`.
 - `tests/abi-kernel`: freestanding `no_std` test kernel linked at
   `0x60000000` like arch/um, run by `cargo xtask test-abi` in CI.

@@ -324,7 +324,7 @@ The authoritative definition is `crates/liu-abi/src/host_ops.rs`.
 |---|---|---|
 | **console** | `log_write`, `panic` | Early boot output. `panic` does not return. |
 | **kernel memory** | `kmap`, `kunmap`, `kprotect` | Map physmem ranges at kernel-chosen addresses inside the window `boot.kmap_base`/`kmap_size` (ABI 0.2), never elsewhere; W+X is refused. Physmem itself is mapped at `boot.physmem_base` before entry. |
-| **address spaces** | `as_create`, `as_destroy`, `as_map`, `as_unmap`, `as_protect`, `as_flush` | Changes are batched until `as_flush` or `as_run`. |
+| **address spaces** | `as_create`, `as_destroy`, `as_map`, `as_unmap`, `as_protect`, `as_flush` | Changes are batched until `as_flush` or `as_run`. Served by the host's trap backend (M2). Guest mappings may be W+X, as Linux allows user programs; kernel mappings may not. |
 | **execution** | `as_run`, `as_get_fpu`, `as_set_fpu` | Run guest user code until the next trap. TLS bases are part of `GuestRegs`. |
 | **cpu** | `irq_enable`, `irq_disable`, `irq_save`, `irq_restore`, `idle` | `idle` blocks the vCPU until an interrupt is pending. |
 | **time** | `clock_monotonic`, `clock_realtime`, `timer_set`, `timer_cancel` | Nanoseconds; tickless one-shot deadline. |
@@ -724,7 +724,7 @@ are generic (D5).
 | Unit | ABI layout and negotiation, ELF validation, style rules | `cargo test` ✅ |
 | Platform | shared memory, processes, Capsicum, `PT_SET_SC_RET` on the running kernel | `crates/liu-platform/tests` ✅ |
 | ABI drift | regenerate `host.h` and fail on diff; compile a C probe and compare every offset | `cargo xtask check-header`, `check-abi` ✅ |
-| ABI conformance | a freestanding Rust test kernel that calls every `host_ops` entry | `cargo xtask test-abi` ✅ |
+| ABI conformance | a freestanding Rust test kernel that calls every `host_ops` entry | `cargo xtask test-abi` ✅ (on Renux it also runs a Linux program in a guest space) |
 | Trap backends | hand-assembled Linux code in a guest space: syscalls, errors, faults, TLS | `crates/liu-platform/tests/trap_renux.rs` ✅ (Renux only) |
 | Boot | boot `liu_defconfig` to a busybox initramfs and script a shell session | `cargo xtask test-boot` (M3) |
 | Compatibility | selected Linux Test Project suites inside the guest | nightly (M5) |

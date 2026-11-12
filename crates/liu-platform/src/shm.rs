@@ -96,6 +96,14 @@ impl SharedMemory
         return (Ok(SharedMemory { fd: fd, size: size }));
     }
 
+    /// Returns a second handle to the same object (a duplicated
+    /// descriptor).
+    pub fn
+    try_clone(&self) -> io::Result<SharedMemory>
+    {
+        return (Ok(SharedMemory { fd: self.fd.try_clone()?, size: self.size }));
+    }
+
     /// Size of the object in bytes.
     pub fn
     size(&self) -> u64

@@ -7,7 +7,8 @@
 //! `extern "C"` function aborts the process.
 //!
 //! Entries not served yet are left null, so the kernel sees them as absent:
-//! address spaces and execution arrive in M2, devices in M4.
+//! guest FPU state (`as_get_fpu`, `as_set_fpu`) arrives later in M2,
+//! devices in M4.
 
 use std::io::{self, Write};
 use std::process;
@@ -16,17 +17,21 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use liu_abi::status::{STATUS_INVALID, STATUS_IO, STATUS_OK};
-use liu_abi::{provides, BootInfo, Error, HostOps, KernelEntry, KernelOps, Status};
+use liu_abi::{provides, BootInfo, Error, GuestRegs, Handle, HostOps, KernelEntry, KernelOps, Status, TrapEvent};
 
 use crate::cpu::{Cpu, Delivery};
 use crate::image::KernelImage;
 use crate::kmem::KernelMemory;
+use crate::spaces::Spaces;
 
 /// The single vCPU of this kernel process.
 static CPU: Cpu = Cpu::new();
 
 /// Memory of the running kernel, owned here while it runs.
 static KMEM: Mutex<Option<KernelMemory>> = Mutex::new(None);
+
+/// Guest spaces of the running kernel.
+static SPACES: Mutex<Option<Spaces>> = Mutex::new(None);
 
 /// The kernel's table, filled by the kernel during `liu_kernel_entry`.
 static KERNEL_OPS: AtomicPtr<KernelOps> = AtomicPtr::new(ptr::null_mut());
@@ -316,6 +321,122 @@ kstack_free(addr: u64, size: u64) -> ()
     });
 }
 
+/// Runs `op` on the running kernel's guest spaces and converts the result.
+fn
+with_spaces(op: &mut dyn FnMut(&mut Spaces) -> Result<(), Error>) -> Status
+{
+    let mut guard: MutexGuard<'_, Option<Spaces>> = SPACES.lock().unwrap_or_else(PoisonError::into_inner);
+    let result: Result<(), Error> = match guard.as_mut()
+    {
+        Some(spaces) => op(spaces),
+        None => Err(Error::Invalid),
+    };
+
+    return (Error::from_result(result));
+}
+
+/// `host_ops.as_create`: stores the new space's handle in `out`.
+unsafe extern "C" fn
+as_create(out: *mut Handle) -> Status
+{
+    if out.is_null()
+    {
+        return (STATUS_INVALID);
+    }
+
+    let mut handle: Handle = 0;
+    let status: Status = with_spaces(&mut |spaces: &mut Spaces| -> Result<(), Error>
+    {
+        handle = spaces.create()?;
+        return (Ok(()));
+    });
+
+    if status == STATUS_OK
+    {
+        // SAFETY: checked non-null; the ABI requires `out` to be writable.
+        unsafe
+        {
+            out.write(handle);
+        }
+    }
+
+    return (status);
+}
+
+/// `host_ops.as_destroy`.
+unsafe extern "C" fn
+as_destroy(space: Handle) -> Status
+{
+    return (with_spaces(&mut |spaces: &mut Spaces| -> Result<(), Error>
+    {
+        return (spaces.destroy(space));
+    }));
+}
+
+/// `host_ops.as_map`.
+unsafe extern "C" fn
+as_map(space: Handle, vaddr: u64, phys: u64, len: u64, prot: u32) -> Status
+{
+    return (with_spaces(&mut |spaces: &mut Spaces| -> Result<(), Error>
+    {
+        return (spaces.map(space, vaddr, phys, len, prot));
+    }));
+}
+
+/// `host_ops.as_unmap`.
+unsafe extern "C" fn
+as_unmap(space: Handle, vaddr: u64, len: u64) -> Status
+{
+    return (with_spaces(&mut |spaces: &mut Spaces| -> Result<(), Error>
+    {
+        return (spaces.unmap(space, vaddr, len));
+    }));
+}
+
+/// `host_ops.as_protect`.
+unsafe extern "C" fn
+as_protect(space: Handle, vaddr: u64, len: u64, prot: u32) -> Status
+{
+    return (with_spaces(&mut |spaces: &mut Spaces| -> Result<(), Error>
+    {
+        return (spaces.protect(space, vaddr, len, prot));
+    }));
+}
+
+/// `host_ops.as_flush`.
+unsafe extern "C" fn
+as_flush(space: Handle) -> Status
+{
+    return (with_spaces(&mut |spaces: &mut Spaces| -> Result<(), Error>
+    {
+        return (spaces.flush(space));
+    }));
+}
+
+/// `host_ops.as_run`: runs guest code until the next trap. `regs` is read
+/// on entry and updated in place; the trap is stored in `event`.
+///
+/// Interrupts are not delivered while the guest runs (ADR 0008): a guest
+/// that never traps holds the vCPU until M3 adds asynchronous delivery.
+unsafe extern "C" fn
+as_run(space: Handle, regs: *mut GuestRegs, event: *mut TrapEvent) -> Status
+{
+    if regs.is_null() || event.is_null()
+    {
+        return (STATUS_INVALID);
+    }
+
+    // SAFETY: checked non-null; the ABI requires both to be valid,
+    // writable and unaliased for the duration of the call.
+    let (regs, event): (&mut GuestRegs, &mut TrapEvent) = unsafe { (&mut *regs, &mut *event) };
+
+    return (with_spaces(&mut |spaces: &mut Spaces| -> Result<(), Error>
+    {
+        *event = spaces.run(space, regs)?;
+        return (Ok(()));
+    }));
+}
+
 const fn
 host_ops() -> HostOps
 {
@@ -328,6 +449,13 @@ host_ops() -> HostOps
     ops.kprotect = Some(kprotect);
     ops.kstack_alloc = Some(kstack_alloc);
     ops.kstack_free = Some(kstack_free);
+    ops.as_create = Some(as_create);
+    ops.as_destroy = Some(as_destroy);
+    ops.as_map = Some(as_map);
+    ops.as_unmap = Some(as_unmap);
+    ops.as_protect = Some(as_protect);
+    ops.as_flush = Some(as_flush);
+    ops.as_run = Some(as_run);
     ops.irq_enable = Some(irq_enable);
     ops.irq_disable = Some(irq_disable);
     ops.irq_save = Some(irq_save);
@@ -346,17 +474,19 @@ host_ops() -> HostOps
 static HOST_OPS: HostOps = host_ops();
 
 /// Calls `liu_kernel_entry` of a loaded image on the current thread, with
-/// interrupts disabled and no timer armed. `kmem` serves the kernel memory
-/// entries until the kernel returns, and is released then.
+/// interrupts disabled and no timer armed. `kmem` and `spaces` serve the
+/// kernel memory and address space entries until the kernel returns, and
+/// are released then.
 ///
 /// The call returns when the kernel shuts down; the result is its status.
 /// One kernel runs per process: `enter` must not be called concurrently.
 pub fn
-enter(image: &KernelImage, kmem: KernelMemory, kernel: &mut KernelOps, boot: &BootInfo) -> Status
+enter(image: &KernelImage, kmem: KernelMemory, spaces: Spaces, kernel: &mut KernelOps, boot: &BootInfo) -> Status
 {
     let table: *mut KernelOps = kernel;
 
     *KMEM.lock().unwrap_or_else(PoisonError::into_inner) = Some(kmem);
+    *SPACES.lock().unwrap_or_else(PoisonError::into_inner) = Some(spaces);
     CPU.reset();
     KERNEL_OPS.store(table, Ordering::SeqCst);
 
@@ -373,7 +503,9 @@ enter(image: &KernelImage, kmem: KernelMemory, kernel: &mut KernelOps, boot: &Bo
 
     KERNEL_OPS.store(ptr::null_mut(), Ordering::SeqCst);
     CPU.reset();
-    // Unmaps the window, physical memory and every stack.
+    // Kills every guest process, then unmaps the window, physical memory
+    // and every stack.
+    drop(SPACES.lock().unwrap_or_else(PoisonError::into_inner).take());
     drop(KMEM.lock().unwrap_or_else(PoisonError::into_inner).take());
 
     return (status);

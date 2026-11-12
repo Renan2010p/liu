@@ -15,6 +15,7 @@ pub mod image;
 pub mod kmem;
 #[allow(unsafe_code)]
 pub mod ops;
+pub mod spaces;
 
 use std::fmt;
 use std::fs;
@@ -23,9 +24,10 @@ use std::thread;
 
 use liu_abi::{BootInfo, KernelOps, Status, TableHeader, HANDLE_INVALID, PAGE_SIZE};
 use liu_physmem::Physmem;
-use liu_platform::Window;
+use liu_platform::{Capabilities, SharedMemory, TrapBackend, Window};
 
 use kmem::{KernelMemory, KMAP_WINDOW_SIZE};
+use spaces::Spaces;
 
 pub use config::Config;
 pub use image::{KernelImage, LoadError};
@@ -46,6 +48,7 @@ pub enum RuntimeError
     Load(LoadError),
     Physmem(u64, io::Error),
     Window(u64, io::Error),
+    Probe(io::Error),
     Thread(io::Error),
     /// The vCPU thread ended without a status.
     VcpuPanicked,
@@ -69,6 +72,7 @@ impl fmt::Display for RuntimeError
             {
                 write!(f, "cannot reserve the kmap window at {:#x}: {}", addr, error)
             }
+            RuntimeError::Probe(error) => write!(f, "cannot probe the host: {}", error),
             RuntimeError::Thread(error) => write!(f, "cannot start the vCPU thread: {}", error),
             RuntimeError::VcpuPanicked => f.write_str("the vCPU thread panicked"),
         };
@@ -102,6 +106,9 @@ run(config: &Config) -> Result<Status, RuntimeError>
         return (Err(RuntimeError::PageSize(page)));
     }
 
+    // Probing forks helper processes: do it before any thread exists.
+    let caps: Capabilities = liu_platform::probe().map_err(RuntimeError::Probe)?;
+    let backend: Option<Box<dyn TrapBackend>> = liu_platform::open_trap_backend(&caps).ok();
     let data: Vec<u8> = fs::read(&config.kernel).map_err(RuntimeError::Read)?;
     let image: KernelImage = KernelImage::load(&data).map_err(RuntimeError::Load)?;
 
@@ -113,6 +120,11 @@ run(config: &Config) -> Result<Status, RuntimeError>
     let window_base: u64 = physmem_base(physmem.base() + physmem.size());
     let window: Window = Window::reserve_at(window_base, KMAP_WINDOW_SIZE as usize)
         .map_err(|error: io::Error| -> RuntimeError { return (RuntimeError::Window(window_base, error)); })?;
+    let guest_physmem: SharedMemory = physmem.shm().try_clone()
+        .map_err(|error: io::Error| -> RuntimeError { return (RuntimeError::Physmem(base, error)); })?;
+    let spaces: Spaces = Spaces::new(backend, guest_physmem);
+
+    eprintln!("liu-kernel: trap backend: {}", spaces.backend_name());
     let kmem: KernelMemory = KernelMemory::new(physmem, window);
     let cmdline: &[u8] = config.cmdline.as_bytes();
 
@@ -124,7 +136,7 @@ run(config: &Config) -> Result<Status, RuntimeError>
                 .stack_size(VCPU_STACK_SIZE)
                 .spawn_scoped(scope, || -> Status
                 {
-                    return (vcpu_main(&image, kmem, cmdline));
+                    return (vcpu_main(&image, kmem, spaces, cmdline));
                 })
                 .map_err(RuntimeError::Thread)?;
 
@@ -141,7 +153,7 @@ run(config: &Config) -> Result<Status, RuntimeError>
 /// Body of the vCPU thread: builds the boot tables and enters the kernel,
 /// which owns `kmem` until it returns.
 fn
-vcpu_main(image: &KernelImage, kmem: KernelMemory, cmdline: &[u8]) -> Status
+vcpu_main(image: &KernelImage, kmem: KernelMemory, spaces: Spaces, cmdline: &[u8]) -> Status
 {
     let boot: BootInfo = BootInfo
     {
@@ -164,7 +176,7 @@ vcpu_main(image: &KernelImage, kmem: KernelMemory, cmdline: &[u8]) -> Status
     };
     let mut kernel: KernelOps = KernelOps::empty();
 
-    return (ops::enter(image, kmem, &mut kernel, &boot));
+    return (ops::enter(image, kmem, spaces, &mut kernel, &boot));
 }
 
 #[cfg(test)]

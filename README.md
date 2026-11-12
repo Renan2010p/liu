@@ -132,6 +132,8 @@ abi-kernel: timer ok (safe points, cancel, handlers disabled)
 abi-kernel: kmap 0x62200000 aliases phys 0x100000
 abi-kernel: kmem ok (protect, unmap, refusals)
 abi-kernel: kstack ok (ran at 0x31bd1987efe8 on a 16 KiB stack)
+abi-kernel: guest wrote "hello from a Linux guest"
+abi-kernel: guest ok (exit 42, demand-paged byte 42)
 abi-kernel: pass
 test-abi: passed
 ```

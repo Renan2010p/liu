@@ -19,7 +19,9 @@ use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 
 use liu_abi::status::{STATUS_DENIED, STATUS_FAULT, STATUS_INVALID, STATUS_OK, STATUS_UNSUPPORTED};
-use liu_abi::{provides, BootInfo, HostOps, KernelOps, Status, PAGE_SIZE, PROT_EXEC, PROT_READ, PROT_WRITE};
+use liu_abi::trap::{TRAP_PAGE_FAULT, TRAP_SYSCALL};
+use liu_abi::{provides, BootInfo, GuestRegs, Handle, HostOps, KernelOps, Status, TrapEvent};
+use liu_abi::{PAGE_SIZE, PROT_EXEC, PROT_READ, PROT_WRITE};
 
 /// The host table, kept for the panic and timer handlers.
 static HOST: AtomicPtr<HostOps> = AtomicPtr::new(core::ptr::null_mut());
@@ -442,6 +444,202 @@ check_kstack(con: &mut Console, host: &HostOps, _boot: &BootInfo) -> Result<bool
     return (Ok(true));
 }
 
+/// Guest layout of the Linux program: virtual address and physical page.
+const GUEST_CODE: (u64, u64) = (0x40_0000, 0x20_0000);
+const GUEST_STACK: (u64, u64) = (0x60_0000, 0x20_1000);
+const GUEST_LAZY: (u64, u64) = (0x50_0000, 0x20_2000);
+
+/// Linux x86_64 system calls the program makes.
+const NR_WRITE: u64 = 1;
+const NR_EXIT: u64 = 60;
+const ENOSYS: i64 = 38;
+
+/// A static Linux x86_64 program:
+///
+/// ```text
+///  0: mov byte [0x500000], 42      ; unmapped: demand paging
+///  8: lea rsi, [rip + 34]          ; msg at 49
+/// 15: mov edi, 1
+/// 20: mov edx, 25
+/// 25: mov eax, 1                   ; write(1, msg, 25)
+/// 30: syscall
+/// 32: movzx edi, byte [0x500000]
+/// 40: mov eax, 60                  ; exit(42)
+/// 45: syscall
+/// 47: ud2
+/// 49: "hello from a Linux guest\n"
+/// ```
+const GUEST_PROGRAM: [u8; 74] = [
+    0xc6, 0x04, 0x25, 0x00, 0x00, 0x50, 0x00, 0x2a, 0x48, 0x8d, 0x35, 0x22, 0x00, 0x00, 0x00,
+    0xbf, 0x01, 0x00, 0x00, 0x00, 0xba, 0x19, 0x00, 0x00, 0x00, 0xb8, 0x01, 0x00, 0x00, 0x00,
+    0x0f, 0x05, 0x0f, 0xb6, 0x3c, 0x25, 0x00, 0x00, 0x50, 0x00, 0xb8, 0x3c, 0x00, 0x00, 0x00,
+    0x0f, 0x05, 0x0f, 0x0b, b'h', b'e', b'l', b'l', b'o', b' ', b'f', b'r', b'o', b'm', b' ',
+    b'a', b' ', b'L', b'i', b'n', b'u', b'x', b' ', b'g', b'u', b'e', b's', b't', b'\n',
+];
+
+/// What the guest did, as seen by this "kernel".
+struct GuestRun
+{
+    exit_code: Option<u64>,
+    faults: u32,
+    wrote: usize,
+}
+
+/// Plays the Linux kernel for one guest space until the program exits.
+fn
+serve_guest(con: &mut Console, host: &HostOps, boot: &BootInfo, space: Handle) -> Result<GuestRun, Missing>
+{
+    let run: unsafe extern "C" fn(Handle, *mut GuestRegs, *mut TrapEvent) -> Status = need(host.as_run, "as_run")?;
+    let map: unsafe extern "C" fn(Handle, u64, u64, u64, u32) -> Status = need(host.as_map, "as_map")?;
+    let mut regs: GuestRegs = GuestRegs
+    {
+        rip: GUEST_CODE.0,
+        rsp: GUEST_STACK.0 + PAGE_SIZE,
+        rflags: 0x202,
+        ..GuestRegs::default()
+    };
+    let mut result: GuestRun = GuestRun { exit_code: None, faults: 0, wrote: 0 };
+
+    for _ in 0..16
+    {
+        let mut event: TrapEvent = TrapEvent::default();
+
+        // SAFETY: `regs` and `event` are valid, writable and unaliased.
+        if unsafe { run(space, &mut regs, &mut event) } != STATUS_OK
+        {
+            let _: fmt::Result = writeln!(con, "abi-kernel: FAIL as_run");
+            return (Ok(result));
+        }
+        match (event.kind, event.code)
+        {
+            (TRAP_PAGE_FAULT, _) if event.addr & !(PAGE_SIZE - 1) == GUEST_LAZY.0 && result.faults == 0 =>
+            {
+                // Demand paging: back the page, then retry the instruction.
+                result.faults += 1;
+
+                // SAFETY: a host entry taking plain integers.
+                if unsafe { map(space, GUEST_LAZY.0, GUEST_LAZY.1, PAGE_SIZE, PROT_READ | PROT_WRITE) } != STATUS_OK
+                {
+                    return (Ok(result));
+                }
+            }
+            (TRAP_SYSCALL, NR_WRITE) =>
+            {
+                let (buf, len): (u64, u64) = (regs.rsi, regs.rdx);
+
+                if buf < GUEST_CODE.0 || buf + len > GUEST_CODE.0 + PAGE_SIZE
+                {
+                    regs.rax = (-14i64) as u64;
+                    continue;
+                }
+
+                let phys: u64 = GUEST_CODE.1 + (buf - GUEST_CODE.0);
+
+                // SAFETY: the range was checked to lie in the code page,
+                // which is mapped linearly at `physmem_base + phys`.
+                let bytes: &[u8] =
+                    unsafe { core::slice::from_raw_parts((boot.physmem_base + phys) as usize as *const u8, len as usize) };
+                let text: &str = core::str::from_utf8(bytes).unwrap_or("<not utf-8>").trim_end();
+
+                let _: fmt::Result = writeln!(con, "abi-kernel: guest wrote \"{}\"", text);
+                result.wrote = len as usize;
+                regs.rax = len;
+            }
+            (TRAP_SYSCALL, NR_EXIT) =>
+            {
+                result.exit_code = Some(regs.rdi);
+                return (Ok(result));
+            }
+            (TRAP_SYSCALL, _) =>
+            {
+                regs.rax = (-ENOSYS) as u64;
+            }
+            _ =>
+            {
+                let _: fmt::Result = writeln!(con, "abi-kernel: FAIL unexpected trap {:?} at {:#x}", event, regs.rip);
+                return (Ok(result));
+            }
+        }
+    }
+
+    return (Ok(result));
+}
+
+/// The `as_*` entries: a static Linux program runs in a guest space, with
+/// its system calls and its page fault served here.
+fn
+check_guest(con: &mut Console, host: &HostOps, boot: &BootInfo) -> Result<bool, Missing>
+{
+    let create: unsafe extern "C" fn(*mut Handle) -> Status = need(host.as_create, "as_create")?;
+    let destroy: unsafe extern "C" fn(Handle) -> Status = need(host.as_destroy, "as_destroy")?;
+    let map: unsafe extern "C" fn(Handle, u64, u64, u64, u32) -> Status = need(host.as_map, "as_map")?;
+    let mut space: Handle = 0;
+
+    // SAFETY: `space` is a writable Handle.
+    match unsafe { create(&mut space) }
+    {
+        STATUS_OK =>
+        {
+        }
+        STATUS_UNSUPPORTED =>
+        {
+            let _: fmt::Result = writeln!(con, "abi-kernel: guest skipped (no trap backend on this host)");
+            return (Ok(true));
+        }
+        other =>
+        {
+            let _: fmt::Result = writeln!(con, "abi-kernel: FAIL as_create {}", other);
+            return (Ok(false));
+        }
+    }
+
+    // SAFETY: the program goes to a physical page the other checks do not
+    // use, through the linear map; the host entries take plain integers.
+    let mapped: (Status, Status) = unsafe
+    {
+        let code: *mut u8 = (boot.physmem_base + GUEST_CODE.1) as usize as *mut u8;
+
+        for (i, byte) in GUEST_PROGRAM.iter().enumerate()
+        {
+            code.add(i).write_volatile(*byte);
+        }
+        (
+            map(space, GUEST_CODE.0, GUEST_CODE.1, PAGE_SIZE, PROT_READ | PROT_EXEC),
+            map(space, GUEST_STACK.0, GUEST_STACK.1, PAGE_SIZE, PROT_READ | PROT_WRITE),
+        )
+    };
+
+    if mapped != (STATUS_OK, STATUS_OK)
+    {
+        let _: fmt::Result = writeln!(con, "abi-kernel: FAIL as_map {:?}", mapped);
+        return (Ok(false));
+    }
+
+    let run: GuestRun = serve_guest(con, host, boot, space)?;
+
+    // SAFETY: a host entry taking a plain integer; it kills the process.
+    let destroyed: Status = unsafe { destroy(space) };
+
+    if run.exit_code != Some(42) || run.faults != 1 || run.wrote != 25 || destroyed != STATUS_OK
+    {
+        let _: fmt::Result = writeln!(
+            con,
+            "abi-kernel: FAIL guest exit {:?}, {} faults, {} bytes written, destroy {}",
+            run.exit_code,
+            run.faults,
+            run.wrote,
+            destroyed
+        );
+        return (Ok(false));
+    }
+
+    // SAFETY: the lazily mapped page is at GUEST_LAZY.1 in physical memory.
+    let lazy: u8 = unsafe { ((boot.physmem_base + GUEST_LAZY.1) as usize as *const u8).read_volatile() };
+
+    let _: fmt::Result = writeln!(con, "abi-kernel: guest ok (exit 42, demand-paged byte {})", lazy);
+    return (Ok(lazy == 42));
+}
+
 /// Runs every check and returns the status the entry point reports.
 fn
 run(host: &HostOps, boot: &BootInfo) -> Status
@@ -454,7 +652,7 @@ run(host: &HostOps, boot: &BootInfo) -> Status
         return (STATUS_INVALID);
     }
 
-    let checks: [Check; 5] = [check_clocks, check_random, check_timer, check_kmem, check_kstack];
+    let checks: [Check; 6] = [check_clocks, check_random, check_timer, check_kmem, check_kstack, check_guest];
 
     for check in checks
     {
