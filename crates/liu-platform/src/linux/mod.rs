@@ -144,3 +144,26 @@ open_trap_backend(_caps: &crate::Capabilities) -> io::Result<Box<dyn crate::trap
 {
     return (Err(io::Error::new(io::ErrorKind::Unsupported, "linux-sysemu is not implemented yet")));
 }
+
+/// Host system call numbers the guest stub executes.
+pub(crate) const SYS_MMAP: u64 = 9;
+pub(crate) const SYS_MUNMAP: u64 = 11;
+pub(crate) const SYS_MPROTECT: u64 = 10;
+
+/// End of the user address space with 4-level paging (`TASK_SIZE_MAX`).
+pub(crate) const USER_TOP: u64 = 0x7fff_ffff_f000;
+
+/// Closes every descriptor from `fd` up. Async-signal-safe.
+// Used by the guest space setup of this host's trap backend, which is
+// not implemented yet.
+#[allow(dead_code)]
+pub(crate) fn
+close_from(fd: libc::c_int) -> ()
+{
+    // SAFETY: close_range has no memory-safety preconditions; it is called
+    // through syscall(2) because older libcs lack the wrapper.
+    unsafe
+    {
+        libc::syscall(libc::SYS_close_range, fd as libc::c_uint, libc::c_uint::MAX, 0);
+    }
+}

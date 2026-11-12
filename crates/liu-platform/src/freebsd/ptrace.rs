@@ -182,6 +182,31 @@ set_gs_base(pid: libc::pid_t, base: u64) -> io::Result<()>
     return (set_base(PT_SETGSBASE, pid, base));
 }
 
+/// `PTRACE_SCE` in the event mask: stop at every system call entry.
+pub const PTRACE_SCE: libc::c_int = 0x0002;
+
+/// Reads the tracee's event mask.
+pub fn
+get_event_mask(pid: libc::pid_t) -> io::Result<libc::c_int>
+{
+    let mut mask: libc::c_int = 0;
+    let size: libc::c_int = mem::size_of::<libc::c_int>() as libc::c_int;
+
+    request(libc::PT_GET_EVENT_MASK, pid, (&mut mask as *mut libc::c_int).cast::<libc::c_char>(), size)?;
+    return (Ok(mask));
+}
+
+/// Sets the tracee's event mask. `PT_TO_SCE` adds `PTRACE_SCE`, and only
+/// this clears it again.
+pub fn
+set_event_mask(pid: libc::pid_t, mask: libc::c_int) -> io::Result<()>
+{
+    let mut value: libc::c_int = mask;
+    let size: libc::c_int = mem::size_of::<libc::c_int>() as libc::c_int;
+
+    return (request(libc::PT_SET_EVENT_MASK, pid, (&mut value as *mut libc::c_int).cast::<libc::c_char>(), size));
+}
+
 /// Renux: completes the system call the tracee is entering with `result`
 /// without executing it. Fails with `EINVAL` outside a syscall-entry stop or
 /// on a kernel without the extension.

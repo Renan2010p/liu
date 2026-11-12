@@ -196,8 +196,21 @@ queues `mmap`, `munmap` and `mprotect` requests in the stub's shared data page
 and resumes the stub, which executes them natively and traps back. Batching
 keeps the number of context switches per `execve` or `mmap` low.
 
-The stub is a few hundred bytes of position-independent code written in
-`no_std` Rust and embedded in the runtime.
+The stub (`crates/liu-platform/src/stub.rs`) is about 80 bytes of
+position-independent assembly in a `global_asm!` block, so no external
+assembler is needed. It lives at `0x7fbfffe000` (code, read-execute) and
+`0x7fbffff000` (operation batch), as in arch/um; guest addresses stop
+below it. It never uses the stack, converts FreeBSD-style errors (carry
+flag) to `-errno`, and stops with `int3` after each batch.
+
+A new space is a fork that becomes traced, maps the two stub pages, keeps
+only the physmem descriptor (as fd 3), drops every piece of user memory
+that the host kernel would otherwise touch on its own (FreeBSD:
+`sigfastblock` and `exterrctl`; Linux will need `rseq`), and jumps into the
+stub, whose first batch unmaps everything else. The guest then sees only
+the stub and the physical memory the kernel maps for it. While the stub
+runs, `PTRACE_SCE` is cleared from the event mask so its own system calls
+execute on the host.
 
 ### 5.4 System call path
 

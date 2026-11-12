@@ -19,6 +19,7 @@
 mod caps;
 mod process;
 mod shm;
+pub mod stub;
 mod sys;
 mod time;
 mod trap;

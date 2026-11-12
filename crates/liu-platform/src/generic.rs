@@ -156,3 +156,26 @@ open_trap_backend(_caps: &crate::Capabilities) -> io::Result<Box<dyn crate::trap
 {
     return (Err(io::Error::from(io::ErrorKind::Unsupported)));
 }
+
+/// The guest stub is not used on these hosts yet (no trap backend).
+pub(crate) const SYS_MMAP: u64 = 0;
+pub(crate) const SYS_MUNMAP: u64 = 0;
+pub(crate) const SYS_MPROTECT: u64 = 0;
+pub(crate) const USER_TOP: u64 = 0;
+
+/// Closes descriptors from `fd` up to an arbitrary limit. Async-signal-safe.
+// Used by the guest space setup of this host's trap backend, which is
+// not implemented yet.
+#[allow(dead_code)]
+pub(crate) fn
+close_from(fd: libc::c_int) -> ()
+{
+    for other in fd..1024
+    {
+        // SAFETY: close has no memory-safety preconditions.
+        unsafe
+        {
+            libc::close(other);
+        }
+    }
+}

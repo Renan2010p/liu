@@ -154,3 +154,23 @@ open_trap_backend(caps: &crate::Capabilities) -> io::Result<Box<dyn crate::trap:
 
     return (Err(io::Error::new(io::ErrorKind::Unsupported, "freebsd-rewrite is not implemented yet")));
 }
+
+/// Host system call numbers the guest stub executes.
+pub(crate) const SYS_MMAP: u64 = 477;
+pub(crate) const SYS_MUNMAP: u64 = 73;
+pub(crate) const SYS_MPROTECT: u64 = 74;
+
+/// End of the user address space of an LA48 process
+/// (`VM_MAXUSER_ADDRESS_LA48`); the shared page is just below it.
+pub(crate) const USER_TOP: u64 = 0x8000_0000_0000;
+
+/// Closes every descriptor from `fd` up. Async-signal-safe.
+pub(crate) fn
+close_from(fd: libc::c_int) -> ()
+{
+    // SAFETY: closefrom has no memory-safety preconditions.
+    unsafe
+    {
+        libc::closefrom(fd);
+    }
+}

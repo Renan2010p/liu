@@ -25,9 +25,13 @@ use liu_abi::trap::{ACCESS_EXEC, ACCESS_READ, ACCESS_WRITE, TRAP_EXITED, TRAP_PA
 use liu_abi::trap::{TRAP_SIGNAL, TRAP_SIG_BUS, TRAP_SIG_FPE, TRAP_SIG_ILL, TRAP_SIG_TRAP, TRAP_SYSCALL};
 use liu_abi::{GuestRegs, TrapEvent};
 
-use super::ptrace::{self, ScResult, EJUSTRETURN};
+use std::os::fd::{AsFd, AsRawFd};
+
+use super::ptrace::{self, ScResult, EJUSTRETURN, PTRACE_SCE};
 use crate::caps::TrapBackendKind;
 use crate::process::{Child, ForkResult, WaitStatus};
+use crate::shm::{Protection, SharedMemory};
+use crate::stub::{self, StubOp, StubQueue, GUEST_PHYSMEM_FD, STUB_CODE, STUB_DATA};
 use crate::trap::{GuestSpace, TrapBackend};
 
 /// Page-fault error code bits (x86 `tf_err`).
@@ -43,9 +47,64 @@ const SEGV_ACCERR: libc::c_int = 2;
 /// Longest x86 instruction: a fault this close after `rip` is a fetch.
 const MAX_INSN_LEN: u64 = 15;
 
-/// Exit status of a space child that was resumed without registers, which
-/// the backend never does.
-const STRAY_EXIT: i32 = 97;
+/// Exit statuses of a space child that could not set itself up.
+const EXIT_TRACE: i32 = 90;
+const EXIT_STUB_MAP: i32 = 91;
+const EXIT_PHYSMEM_FD: i32 = 92;
+const EXIT_UNREGISTER: i32 = 93;
+
+/// User memory that libc and libthr register with the kernel, which the
+/// kernel then reads or writes on its own. The stub unmaps that memory, so
+/// every registration must be dropped first or the kernel itself faults
+/// the guest:
+///
+/// - `sigfastblock(2)`: a word of the libthr thread, read on signal
+///   delivery and return to user mode;
+/// - `exterrctl(2)`: libc's extended-error buffer, written whenever a
+///   system call returns an error, which `EJUSTRETURN` is.
+const SYS_SIGFASTBLOCK: libc::c_int = 573;
+const SIGFASTBLOCK_UNSETPTR: libc::c_long = 3;
+const SYS_EXTERRCTL: libc::c_int = 592;
+const EXTERRCTL_DISABLE: libc::c_long = 2;
+
+/// Drops the kernel registrations listed above. Async-signal-safe. A
+/// registration that does not exist (EINVAL, or ENOSYS on older kernels)
+/// is not an error.
+fn
+unregister_user_memory() -> bool
+{
+    let calls: [(libc::c_int, libc::c_long); 2] =
+        [(SYS_SIGFASTBLOCK, SIGFASTBLOCK_UNSETPTR), (SYS_EXTERRCTL, EXTERRCTL_DISABLE)];
+
+    // An unknown system call raises SIGSYS; make it fail with ENOSYS. Guest
+    // system calls are never executed, so this changes nothing for them.
+    // SAFETY: signal(3) with SIG_IGN is async-signal-safe (sigaction).
+    unsafe
+    {
+        libc::signal(libc::SIGSYS, libc::SIG_IGN);
+    }
+
+    for (nr, op) in calls
+    {
+        // SAFETY: raw system calls whose only pointer argument is null.
+        let ret: libc::c_int = unsafe { libc::syscall(nr, op, 0 as libc::c_long, 0 as libc::c_long) };
+
+        // SAFETY: __error returns the calling thread's errno location.
+        let errno: libc::c_int = unsafe { *libc::__error() };
+
+        if ret == -1 && errno != libc::EINVAL && errno != libc::ENOSYS
+        {
+            return (false);
+        }
+    }
+
+    return (true);
+}
+
+/// `rflags` the stub runs with: interrupts enabled, reserved bit 1.
+const STUB_RFLAGS: i64 = 0x202;
+
+const PAGE: usize = 4096;
 
 /// The Renux `PT_SET_SC_RET` backend.
 #[derive(Debug, Default)]
@@ -64,23 +123,57 @@ impl RenuxSetScRet
     }
 }
 
-/// Child side of a new space: become traced and stop. Only
-/// async-signal-safe calls.
+/// Child side of a new space: become traced, map the stub pages, keep only
+/// the physical memory descriptor, and jump into the stub, which unmaps
+/// everything else and stops with `int3`. Only async-signal-safe calls,
+/// and nothing after the jump uses the stack.
 fn
-space_child() -> !
+space_child(code_fd: libc::c_int, data_fd: libc::c_int, physmem_fd: libc::c_int) -> !
 {
     if ptrace::trace_me().is_err()
     {
         // SAFETY: _exit is async-signal-safe.
-        unsafe { libc::_exit(90) };
+        unsafe { libc::_exit(EXIT_TRACE) };
     }
 
-    // SAFETY: raise and _exit are async-signal-safe. The tracer replaces
-    // the registers before resuming, so `raise` never returns here.
+    let fixed: libc::c_int = libc::MAP_SHARED | libc::MAP_FIXED | libc::MAP_EXCL;
+
+    // SAFETY: mmap with MAP_EXCL cannot replace an existing mapping; the
+    // pages are above anything this process uses.
+    let (code, data): (*mut libc::c_void, *mut libc::c_void) = unsafe
+    {
+        (
+            libc::mmap(STUB_CODE as usize as *mut libc::c_void, PAGE, libc::PROT_READ | libc::PROT_EXEC, fixed, code_fd, 0),
+            libc::mmap(STUB_DATA as usize as *mut libc::c_void, PAGE, libc::PROT_READ | libc::PROT_WRITE, fixed, data_fd, 0),
+        )
+    };
+
+    if code == libc::MAP_FAILED || data == libc::MAP_FAILED
+    {
+        // SAFETY: _exit is async-signal-safe.
+        unsafe { libc::_exit(EXIT_STUB_MAP) };
+    }
+
+    // SAFETY: dup2 is async-signal-safe; the stub pages stay mapped when
+    // their descriptors are closed.
+    if physmem_fd != GUEST_PHYSMEM_FD && unsafe { libc::dup2(physmem_fd, GUEST_PHYSMEM_FD) } == -1
+    {
+        // SAFETY: _exit is async-signal-safe.
+        unsafe { libc::_exit(EXIT_PHYSMEM_FD) };
+    }
+    super::close_from(GUEST_PHYSMEM_FD + 1);
+
+    if !unregister_user_memory()
+    {
+        // SAFETY: _exit is async-signal-safe.
+        unsafe { libc::_exit(EXIT_UNREGISTER) };
+    }
+
+    // SAFETY: STUB_CODE holds the stub, which needs no stack and never
+    // returns here; the cleanup batch was written before the fork.
     unsafe
     {
-        libc::raise(libc::SIGSTOP);
-        libc::_exit(STRAY_EXIT);
+        core::arch::asm!("jmp {entry}", entry = in(reg) STUB_CODE, options(noreturn));
     }
 }
 
@@ -93,39 +186,52 @@ impl TrapBackend for RenuxSetScRet
     }
 
     fn
-    create_space(&mut self) -> io::Result<Box<dyn GuestSpace>>
+    create_space(&mut self, physmem: &SharedMemory) -> io::Result<Box<dyn GuestSpace>>
     {
+        let mut queue: StubQueue = StubQueue::new(physmem.size())?;
+
+        queue.cleanup();
+
+        let cleanup: Vec<StubOp> = queue.take();
+        let (code_fd, data_fd): (libc::c_int, libc::c_int) = (queue.pages().code_fd(), queue.pages().data_fd());
+        let physmem_fd: libc::c_int = physmem.as_fd().as_raw_fd();
+
+        queue.pages().write_batch(&cleanup)?;
+
         // SAFETY: the child branch only runs async-signal-safe code.
         let fork: ForkResult = unsafe { crate::fork()? };
         let mut child: Child = match fork
         {
             ForkResult::Child =>
             {
-                space_child();
+                space_child(code_fd, data_fd, physmem_fd);
             }
             ForkResult::Parent(child) => child,
         };
 
         match child.wait()?
         {
-            WaitStatus::Stopped(libc::SIGSTOP) =>
+            WaitStatus::Stopped(libc::SIGTRAP) =>
             {
             }
             other =>
             {
-                return (Err(io::Error::other(format!("new guest space did not stop: {:?}", other))));
+                return (Err(io::Error::other(format!("new guest space did not reach the stub: {:?}", other))));
             }
         }
+        stub::check_results(&queue.pages().results(cleanup.len())?)?;
 
         let pid: libc::pid_t = child.pid();
-        let host: libc::reg = ptrace::get_regs(pid)?;
         let space: SetScRetSpace = SetScRetSpace
         {
-            child: child,
-            host: host,
+            host: ptrace::get_regs(pid)?,
             fs_base: ptrace::get_fs_base(pid)?,
             gs_base: ptrace::get_gs_base(pid)?,
-            at_syscall: false,
+            event_mask: ptrace::get_event_mask(pid)?,
+            child: child,
+            queue: queue,
+            syscall_pending: false,
+            linux_return: false,
             exited: false,
         };
 
@@ -138,13 +244,19 @@ impl TrapBackend for RenuxSetScRet
 struct SetScRetSpace
 {
     child: Child,
+    queue: StubQueue,
     /// Host register state at the last stop. Segment selectors and other
     /// fields `GuestRegs` does not carry are written back unchanged.
     host: libc::reg,
     fs_base: u64,
     gs_base: u64,
-    /// Stopped at a system call entry that must be completed on resume.
-    at_syscall: bool,
+    /// Event mask without `PTRACE_SCE`, used while the stub runs.
+    event_mask: libc::c_int,
+    /// Stopped at a host system call entry that must be skipped before the
+    /// process runs again.
+    syscall_pending: bool,
+    /// The guest returns from a system call: `rcx`/`r11` follow Linux.
+    linux_return: bool,
     exited: bool,
 }
 
@@ -275,7 +387,7 @@ impl SetScRetSpace
     {
         let pid: libc::pid_t = self.child.pid();
 
-        if self.at_syscall
+        if self.linux_return
         {
             // What the Linux `syscall` instruction leaves behind.
             regs.rcx = regs.rip;
@@ -293,13 +405,61 @@ impl SetScRetSpace
             ptrace::set_gs_base(pid, regs.gs_base)?;
             self.gs_base = regs.gs_base;
         }
-        if self.at_syscall
+        self.skip_pending_syscall()?;
+        self.linux_return = false;
+
+        return (Ok(()));
+    }
+
+    /// Completes a system call the process is stopped in without executing
+    /// it, leaving the registers as set.
+    fn
+    skip_pending_syscall(&mut self) -> io::Result<()>
+    {
+        if self.syscall_pending
         {
-            ptrace::set_sc_ret(pid, ScResult::Error(EJUSTRETURN))?;
-            self.at_syscall = false;
+            ptrace::set_sc_ret(self.child.pid(), ScResult::Error(EJUSTRETURN))?;
+            self.syscall_pending = false;
         }
 
         return (Ok(()));
+    }
+
+    /// Runs the queued address-space changes in the stub.
+    fn
+    run_stub(&mut self) -> io::Result<()>
+    {
+        if self.queue.is_empty()
+        {
+            return (Ok(()));
+        }
+
+        let ops: Vec<StubOp> = self.queue.take();
+        let pid: libc::pid_t = self.child.pid();
+        let mut stub_regs: libc::reg = self.host;
+
+        self.queue.pages().write_batch(&ops)?;
+        stub_regs.r_rip = STUB_CODE as i64;
+        stub_regs.r_rflags = STUB_RFLAGS;
+        ptrace::set_regs(pid, &stub_regs)?;
+        self.skip_pending_syscall()?;
+        // The stub's own system calls must run on the host.
+        ptrace::set_event_mask(pid, self.event_mask & !PTRACE_SCE)?;
+        ptrace::cont(pid, 0)?;
+
+        match self.child.wait()?
+        {
+            WaitStatus::Stopped(libc::SIGTRAP) =>
+            {
+            }
+            other =>
+            {
+                self.exited = !matches!(other, WaitStatus::Stopped(_));
+                return (Err(io::Error::other(format!("guest stub did not finish: {:?}", other))));
+            }
+        }
+
+        return (stub::check_results(&self.queue.pages().results(ops.len())?));
     }
 
     /// Reads the state of the stopped process into `regs`.
@@ -326,6 +486,7 @@ impl GuestSpace for SetScRetSpace
         {
             return (Err(io::Error::other("guest space has exited")));
         }
+        self.run_stub()?;
         self.apply(regs)?;
 
         loop
@@ -358,7 +519,8 @@ impl GuestSpace for SetScRetSpace
                 // in the rcx slot, so report what the hardware did.
                 regs.rcx = regs.rip;
                 regs.r11 = regs.rflags;
-                self.at_syscall = true;
+                self.syscall_pending = true;
+                self.linux_return = true;
                 return (Ok(TrapEvent { kind: TRAP_SYSCALL, code: regs.rax, ..TrapEvent::default() }));
             }
             if signo == libc::SIGSEGV
@@ -393,6 +555,46 @@ impl GuestSpace for SetScRetSpace
             // A host signal that means nothing to the guest (job control,
             // a stray SIGSTOP): drop it and keep running.
         }
+    }
+
+    fn
+    map(&mut self, vaddr: u64, len: u64, phys: u64, prot: Protection) -> io::Result<()>
+    {
+        if self.queue.is_full()
+        {
+            self.run_stub()?;
+        }
+        return (self.queue.map(vaddr, len, phys, prot));
+    }
+
+    fn
+    unmap(&mut self, vaddr: u64, len: u64) -> io::Result<()>
+    {
+        if self.queue.is_full()
+        {
+            self.run_stub()?;
+        }
+        return (self.queue.unmap(vaddr, len));
+    }
+
+    fn
+    protect(&mut self, vaddr: u64, len: u64, prot: Protection) -> io::Result<()>
+    {
+        if self.queue.is_full()
+        {
+            self.run_stub()?;
+        }
+        return (self.queue.protect(vaddr, len, prot));
+    }
+
+    fn
+    flush(&mut self) -> io::Result<()>
+    {
+        if self.exited
+        {
+            return (Err(io::Error::other("guest space has exited")));
+        }
+        return (self.run_stub());
     }
 
     fn

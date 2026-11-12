@@ -3,9 +3,10 @@
 //! The Renux trap backend on the running kernel.
 //!
 //! Each test places a few hand-assembled x86_64 instructions of Linux user
-//! code in shared memory, runs them in a guest space, and plays the Linux
-//! kernel: it answers the system calls and checks what the guest saw. The
-//! tests are skipped on hosts without `PT_SET_SC_RET`.
+//! code in guest physical memory, maps it into a guest space the way the
+//! Linux kernel will, runs it, and plays the kernel: it answers the system
+//! calls and checks what the guest saw. The tests are skipped on hosts
+//! without `PT_SET_SC_RET`.
 
 #![cfg(target_os = "freebsd")]
 
@@ -15,6 +16,11 @@ use liu_platform::{Capabilities, GuestSpace, Mapping, Protection, SharedMemory, 
 
 const PAGE: usize = 4096;
 
+/// Guest layout: code, data and stack pages, backed by physical pages 0-2.
+const CODE_VA: u64 = 0x40_0000;
+const DATA_VA: u64 = CODE_VA + PAGE as u64;
+const STACK_VA: u64 = DATA_VA + PAGE as u64;
+
 /// Linux x86_64 system call numbers used by the guest programs.
 const NR_WRITE: u64 = 1;
 const NR_EXIT: u64 = 60;
@@ -22,14 +28,12 @@ const NR_EXIT: u64 = 60;
 /// Interrupts enabled, reserved bit 1 set: a normal user `rflags`.
 const RFLAGS: u64 = 0x202;
 
-/// Guest memory: one page of code, one page of data, one page of stack.
+/// Guest physical memory holding one program.
 struct Guest
 {
-    /// Read-write view the test uses to write code and inspect data.
+    /// Read-write view of physical memory, used as the "kernel" would.
     view: Mapping,
-    /// Read-execute view that the forked space inherits and runs.
-    code: Mapping,
-    _shm: SharedMemory,
+    physmem: SharedMemory,
 }
 
 impl Guest
@@ -37,33 +41,43 @@ impl Guest
     fn
     new(program: &[u8]) -> Guest
     {
-        let shm: SharedMemory = SharedMemory::create(3 * PAGE as u64).unwrap();
-        let mut view: Mapping = shm.map(0, 3 * PAGE, Protection::READ_WRITE).unwrap();
-        let code: Mapping = shm.map(0, PAGE, Protection::READ.union(Protection::EXEC)).unwrap();
+        let physmem: SharedMemory = SharedMemory::create(3 * PAGE as u64).unwrap();
+        let mut view: Mapping = physmem.map(0, 3 * PAGE, Protection::READ_WRITE).unwrap();
 
         view.write_at(0, program).unwrap();
-        return (Guest { view: view, code: code, _shm: shm });
+        return (Guest { view: view, physmem: physmem });
+    }
+
+    /// Creates a space and maps code (read-execute), data and stack.
+    fn
+    space(&self, backend: &mut dyn TrapBackend) -> Box<dyn GuestSpace>
+    {
+        let mut space: Box<dyn GuestSpace> = backend.create_space(&self.physmem).unwrap();
+        let rx: Protection = Protection::READ.union(Protection::EXEC);
+        let len: u64 = PAGE as u64;
+
+        space.map(CODE_VA, len, 0, rx).unwrap();
+        space.map(DATA_VA, len, len, Protection::READ_WRITE).unwrap();
+        space.map(STACK_VA, len, 2 * len, Protection::READ_WRITE).unwrap();
+        return (space);
     }
 
     fn
     code_addr(&self) -> u64
     {
-        return (self.code.as_ptr() as usize as u64);
+        return (CODE_VA);
     }
 
-    /// Guest address of the data page (as seen through the shared view).
     fn
     data_addr(&self) -> u64
     {
-        return (self.view.as_ptr() as usize as u64 + PAGE as u64);
+        return (DATA_VA);
     }
 
     fn
     initial_regs(&self) -> GuestRegs
     {
-        let stack_top: u64 = self.view.as_ptr() as usize as u64 + 3 * PAGE as u64;
-
-        return (GuestRegs { rip: self.code_addr(), rsp: stack_top, rflags: RFLAGS, ..GuestRegs::default() });
+        return (GuestRegs { rip: CODE_VA, rsp: STACK_VA + PAGE as u64, rflags: RFLAGS, ..GuestRegs::default() });
     }
 }
 
@@ -117,7 +131,7 @@ system_calls_are_trapped_and_answered() -> ()
     };
     let guest: Guest = Guest::new(&WRITE_EXIT);
     let code: u64 = guest.code_addr();
-    let mut space: Box<dyn GuestSpace> = backend.create_space().unwrap();
+    let mut space: Box<dyn GuestSpace> = guest.space(backend.as_mut());
     let mut regs: GuestRegs = guest.initial_regs();
     let mut msg: [u8; 6] = [0; 6];
 
@@ -167,7 +181,7 @@ errors_are_returned_in_linux_form() -> ()
         return;
     };
     let guest: Guest = Guest::new(&UNKNOWN_CALL);
-    let mut space: Box<dyn GuestSpace> = backend.create_space().unwrap();
+    let mut space: Box<dyn GuestSpace> = guest.space(backend.as_mut());
     let mut regs: GuestRegs = guest.initial_regs();
 
     assert_eq!(space.run(&mut regs).unwrap().code, 999);
@@ -211,7 +225,7 @@ faults_are_reported_and_fs_base_is_honoured() -> ()
     };
     let mut guest: Guest = Guest::new(&FAULTS_THEN_TLS);
     let code: u64 = guest.code_addr();
-    let mut space: Box<dyn GuestSpace> = backend.create_space().unwrap();
+    let mut space: Box<dyn GuestSpace> = guest.space(backend.as_mut());
     let mut regs: GuestRegs = guest.initial_regs();
 
     guest.view.write_at(PAGE, &0x1122_3344_5566_7788u64.to_le_bytes()).unwrap();
@@ -266,7 +280,7 @@ many_system_calls_keep_guest_state() -> ()
         return;
     };
     let guest: Guest = Guest::new(&GETPID_LOOP);
-    let mut space: Box<dyn GuestSpace> = backend.create_space().unwrap();
+    let mut space: Box<dyn GuestSpace> = guest.space(backend.as_mut());
     let mut regs: GuestRegs = guest.initial_regs();
     let mut calls: u64 = 0;
     let start: std::time::Instant = std::time::Instant::now();
@@ -289,4 +303,71 @@ many_system_calls_keep_guest_state() -> ()
 
     assert_eq!(calls, 10_000, "the loop counter in rbx was disturbed");
     eprintln!("renux-setscret: {} system calls in {:?} ({:.1} us each)", calls, elapsed, elapsed.as_secs_f64() * 1e6 / calls as f64);
+}
+
+/// Address of this static in the runtime; a guest must not see it.
+static RUNTIME_SECRET: u64 = 0x5ec2e7;
+
+#[test]
+fn
+runtime_memory_is_invisible_to_the_guest() -> ()
+{
+    let Some(mut backend): Option<Box<dyn TrapBackend>> = backend()
+    else
+    {
+        return;
+    };
+    let secret: u64 = &RUNTIME_SECRET as *const u64 as usize as u64;
+    // mov rax, [secret] (movabs); mov eax, 60; syscall
+    let mut program: Vec<u8> = vec![0x48, 0xa1];
+
+    program.extend_from_slice(&secret.to_le_bytes());
+    program.extend_from_slice(&[0xb8, 0x3c, 0x00, 0x00, 0x00, 0x0f, 0x05]);
+
+    let guest: Guest = Guest::new(&program);
+    let mut space: Box<dyn GuestSpace> = guest.space(backend.as_mut());
+    let mut regs: GuestRegs = guest.initial_regs();
+
+    expect_fault(&mut space, &mut regs, secret, ACCESS_READ);
+    assert_eq!(regs.rip, CODE_VA);
+}
+
+/// mov byte [DATA_VA], 1; mov eax, 60; syscall
+const WRITE_DATA: [u8; 15] = [
+    0xc6, 0x04, 0x25, 0x00, 0x10, 0x40, 0x00, 0x01, 0xb8, 0x3c, 0x00, 0x00, 0x00, 0x0f, 0x05,
+];
+
+#[test]
+fn
+protect_and_unmap_change_the_guest_view() -> ()
+{
+    let Some(mut backend): Option<Box<dyn TrapBackend>> = backend()
+    else
+    {
+        return;
+    };
+    let guest: Guest = Guest::new(&WRITE_DATA);
+    let mut space: Box<dyn GuestSpace> = guest.space(backend.as_mut());
+    let mut regs: GuestRegs = guest.initial_regs();
+    let mut byte: [u8; 1] = [0];
+
+    // Read-only data page: the store faults as a write.
+    space.protect(DATA_VA, PAGE as u64, Protection::READ).unwrap();
+    expect_fault(&mut space, &mut regs, DATA_VA, ACCESS_WRITE);
+
+    // The "kernel" makes it writable and retries the instruction.
+    space.protect(DATA_VA, PAGE as u64, Protection::READ_WRITE).unwrap();
+    assert_eq!(space.run(&mut regs).unwrap().code, NR_EXIT);
+    guest.view.read_at(PAGE, &mut byte).unwrap();
+    assert_eq!(byte, [1], "the store did not reach physical memory");
+
+    // Without the page, the same store finds nothing mapped.
+    space.unmap(DATA_VA, PAGE as u64).unwrap();
+    regs.rip = CODE_VA;
+    expect_fault(&mut space, &mut regs, DATA_VA, ACCESS_READ);
+
+    // Refused before reaching the stub.
+    assert!(space.map(0x40_0001, PAGE as u64, 0, Protection::READ).is_err());
+    assert!(space.map(DATA_VA, PAGE as u64, 3 * PAGE as u64, Protection::READ).is_err());
+    assert!(space.unmap(liu_platform::stub::STUB_CODE, PAGE as u64).is_err());
 }

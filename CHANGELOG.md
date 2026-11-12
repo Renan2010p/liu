@@ -41,5 +41,9 @@ All notable changes to LIU are documented here.
   `PT_SET_SC_RET(EJUSTRETURN)` so the guest sees exact Linux semantics;
   faults with derived access type; FS/GS base. Tests run hand-assembled
   Linux code on Renux (6.6 µs per system call).
+- `liu-platform`: the guest stub. Guest spaces now contain only the stub
+  and physmem mapped by `GuestSpace::map`; address-space changes
+  (`map`, `unmap`, `protect`) are validated, queued and applied in batches
+  of up to 63 by the stub.
 - `tests/abi-kernel`: freestanding `no_std` test kernel linked at
   `0x60000000` like arch/um, run by `cargo xtask test-abi` in CI.
